@@ -219,7 +219,7 @@
               listen 80;
               listen [::]:80;
               server_name {{ site_name }};
-              return 301 https://$host$request_uri;
+              return 308 https://$host$request_uri;
           }
 
           server {
