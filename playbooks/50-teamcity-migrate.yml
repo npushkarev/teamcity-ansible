@@ -32,7 +32,7 @@
     tls_src_dir: "{{ playbook_dir }}/../files/tls"
     tls_crt_files: >-
       {{ query('fileglob', tls_src_dir ~ '/*.crt') + query('fileglob', tls_src_dir ~ '/*.cer')
-         + query('fileglob', tls_src_dir ~ '/*.pem') }}
+         + query('fileglob', tls_src_dir ~ '/*.pem') + query('fileglob', tls_src_dir ~ '/*.der') }}
     tls_key_files: "{{ query('fileglob', tls_src_dir ~ '/*.key') }}"
   tasks:
     - name: Read inventory/vault.yml when present (proxy for apt)
@@ -54,7 +54,7 @@
           - tls_crt_files | length == 1
           - tls_key_files | length == 1
         fail_msg: >-
-          В files/tls/ нужно ровно по одному файлу: сертификат (.cer/.crt/.pem) и ключ (.key).
+          В files/tls/ нужно ровно по одному файлу: сертификат (.cer/.crt/.pem/.der) и ключ (.key).
           Сейчас: сертификаты {{ tls_crt_files | map('basename') | list }},
           ключи {{ tls_key_files | map('basename') | list }}.
         quiet: true
@@ -113,7 +113,7 @@
     tls_src_dir: "{{ playbook_dir }}/../files/tls"
     tls_crt_src: >-
       {{ (query('fileglob', tls_src_dir ~ '/*.crt') + query('fileglob', tls_src_dir ~ '/*.cer')
-          + query('fileglob', tls_src_dir ~ '/*.pem')) | first }}
+          + query('fileglob', tls_src_dir ~ '/*.pem') + query('fileglob', tls_src_dir ~ '/*.der')) | first }}
     tls_key_src: "{{ query('fileglob', tls_src_dir ~ '/*.key') | first }}"
     compose: [docker, compose, --project-directory, "{{ tc_dir }}", -f, "{{ tc_dir }}/compose.yaml"]
   pre_tasks:
