@@ -1,12 +1,12 @@
-# TeamCity 2026.2 на чистом Debian 13 из ProGet
+# TeamCity 2026.2 на Debian 13 из ProGet с переносом данных
 
-Три плейбука поднимают TeamCity Server и PostgreSQL 16 в Docker на новой ВМ:
+Три плейбука готовят новую ВМ и TeamCity Server с PostgreSQL 16 в Docker, куда затем восстанавливаются данные старого TeamCity 2018.1.3 (проекты, пользователи, история, артефакты):
 
 | Плейбук | Что делает |
 |---|---|
 | `00-bootstrap-keys.yml` | hostname, `/etc/hosts`, прокси apt, Python, время (chrony), базовые пакеты, сертификат УЦ и ProGet в apt, SSH-ключ control node |
 | `01-expand-root.yml` | растягивает корень `/` на весь диск, swap-раздел заменяет файлом `/swapfile` |
-| `53-teamcity-proget.yml` | Docker и Compose v2 из Debian, настройки Docker, `docker login` в ProGet, запуск TeamCity и PostgreSQL |
+| `53-teamcity-proget.yml` | Docker и Compose v2 из Debian, настройки Docker, образы из ProGet, Compose. При переносе (по умолчанию) TeamCity **не запускается** |
 
 Локальный build agent не создаётся: сборки выполняет внешний агент.
 
@@ -49,7 +49,7 @@ ansible-vault encrypt inventory/vault.yml
 
 `inventory/hosts.yml` и `inventory/vault.yml` в git не попадают. Оба плейбука, `00` и `53`, читают один и тот же `vault.yml`.
 
-## 3. Запуск
+## 3. Подготовить ВМ
 
 Подставьте имя ВМ из `hosts.yml`. Флаг `--limit` обязателен.
 
@@ -59,19 +59,74 @@ H=deb-13-test-teamcity.inc.elara.local
 # Подготовка Debian. Пароль root нужен только здесь.
 ansible-playbook playbooks/00-bootstrap-keys.yml --limit $H --ask-pass --ask-vault-pass
 
-# Snapshot ВМ в vSphere! Затем расширение диска.
+# Увеличьте диск в vSphere, сделайте snapshot ВМ, затем расширение диска.
 ansible-playbook playbooks/01-expand-root.yml --limit $H -e expand_root_confirm=yes
-
-# TeamCity.
-ansible-playbook playbooks/53-teamcity-proget.yml --limit $H --ask-vault-pass
 ```
-
-Откройте `http://<IP>:8111` и завершите мастер настройки TeamCity. Затем подключите внешний агент и авторизуйте его в **Agents → Unauthorized**.
 
 Варианты для `00`:
 
 - нет `ca.crt` — добавьте `-e bootstrap_proget_enabled=false`, а в `hosts.yml` поставьте `teamcity_registry_insecure: true`;
 - время уже выставлено и NTP недоступен — добавьте `-e bootstrap_time_sync=false`.
+
+## 4. Backup старого TeamCity и копирование на ВМ
+
+Старый сервер при этом **не меняется** и остаётся точкой отката.
+
+- **Репетиция** — без остановки: **Administration → Backup**, scope *Custom*: база, настройки, логи сборок, personal changes.
+- **Финальный перенос** — в окно простоя: дождаться завершения сборок, остановить сервер и сделать backup той же версией 2018.1.3:
+  ```bash
+  <TeamCity Home>/bin/maintainDB.sh backup -C -D -L -P -U -A <Data Directory> -F TeamCity_Backup
+  ```
+
+**Артефакты сборок в ZIP не входят**: скопируйте отдельно `<Data Directory>/system/artifacts`.
+
+На новой ВМ:
+
+```bash
+mkdir -p /srv/teamcity-migration
+# положить сюда TeamCity_Backup.zip и каталог artifacts/
+chown -R 1000:1000 /srv/teamcity-migration   # TeamCity в контейнере работает под UID 1000
+chmod 700 /srv/teamcity-migration            # в ZIP есть пароли и токены
+```
+
+## 5. Подготовить TeamCity без запуска
+
+```bash
+ansible-playbook playbooks/53-teamcity-proget.yml --limit $H --ask-vault-pass
+```
+
+В `hosts.yml` уже стоят `teamcity_start_containers: false` и `teamcity_migration_staging_dir: /srv/teamcity-migration`. `53` ставит Docker, скачивает образы и пишет `/opt/teamcity-2026/compose.yaml`, но **не запускает** TeamCity и PostgreSQL. Если запустить их раньше времени, создастся пустая база, и восстанавливать будет некуда. Если каталога `/srv/teamcity-migration` нет, `53` остановится.
+
+## 6. Артефакты и восстановление (на ВМ)
+
+Сначала артефакты, **до** первого запуска сервера:
+
+```bash
+cd /opt/teamcity-2026
+docker compose create db server                    # создать тома, ничего не запуская
+IMG=$(docker compose config --images | grep teamcity-server)
+docker run --rm --network none --user 0:0 \
+  -v teamcity-2026_server_data:/target \
+  -v /srv/teamcity-migration/artifacts:/source:ro \
+  --entrypoint sh "$IMG" \
+  -ec 'mkdir -p /target/system/artifacts && cp -a /source/. /target/system/artifacts/ && chown -R 1000:1000 /target/system/artifacts'
+docker compose up -d db server
+```
+
+Откройте `http://<IP>:8111` → **Restore from backup**:
+
+- файл `/migration/TeamCity_Backup.zip`;
+- база PostgreSQL: сервер `db:5432`, база и пользователь `teamcity`, пароль — `vault_teamcity_db_password` из `vault.yml`.
+
+Нового администратора **не создавайте**: пользователи придут из backup. После восстановления TeamCity предложит обновить формат данных 2018 → 2026. Это **необратимо**: старый 2018.1.3 на этих данных уже не запустится. Старый сервер со своими данными при этом остаётся нетронутым.
+
+Восстановленный сервер ведёт себя как настоящий: опрашивает VCS, отправляет письма и webhooks. На репетиции отключите сборки по триггерам и уведомления сразу после восстановления.
+
+Проверьте проекты, пользователей, историю и артефакты, запустите пробную сборку на внешнем агенте (**Agents → Unauthorized** → авторизовать).
+
+**Финальный перенос** — из **нового** backup и в **чистые** тома. Данные репетиции для него не годятся: используйте новую ВМ или удалите тома репетиции (`docker compose down -v` удалит базу и данные — только осознанно). Затем переключите агентов и адрес на новый сервер. Откат — снова запустить старый сервер.
+
+**Чистая установка без переноса:** в `hosts.yml` поставьте `teamcity_start_containers: true` и удалите `teamcity_migration_staging_dir`, затем выполните `53`, откройте `http://<IP>:8111` и пройдите мастер настройки.
 
 ## Расширение диска (01)
 
