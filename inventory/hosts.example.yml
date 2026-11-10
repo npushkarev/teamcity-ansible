@@ -28,3 +28,14 @@ all:
         # 50 сам принимает лицензионное соглашение TeamCity 2026
         # (https://www.jetbrains.com/legal/docs/teamcity/license/). Принимать в браузере:
         # teamcity_accept_license_agreement: false
+
+    # Linux-агенты для 60-teamcity-agents-linux.yml (вход root; первый запуск с --ask-pass).
+    # Адрес сервера для агентов: https://<teamcity_public_name или имя ВМ TeamCity>;
+    # свой — teamcity_agents_server_url. Каталог старого агента не /opt/buildAgent —
+    # teamcity_agent_old_dir; старый агент работает от root — teamcity_agent_user: <пользователь>.
+    teamcity_agents_linux:
+      hosts:
+        ba-deb12-01.inc.elara.local:
+        # ba-deb-01.inc.elara.local:
+        #   teamcity_agent_old_dir: /home/teamcity/buildAgent
+

@@ -18,3 +18,8 @@ vault_teamcity_db_password: "CHANGE_ME_POSTGRES_PASSWORD"
 # Учётка ProGet для docker login (53): пользователь и пароль или API-ключ.
 vault_proget_registry_user: "CHANGE_ME_PROGET_USER"
 vault_proget_registry_password: "CHANGE_ME_PROGET_PASSWORD"
+
+# 60-teamcity-agents-linux: токен администратора НОВОГО TeamCity (Profile → Access Tokens),
+# чтобы авторизовать перенесённых агентов и поставить их в пул старых. Пусто — вручную.
+vault_teamcity_admin_token: ""
+

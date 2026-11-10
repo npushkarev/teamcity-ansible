@@ -16,3 +16,7 @@ migration/*
 # Сертификат и ключ https — только локально.
 files/tls/*
 !files/tls/README.md
+
+# Java для агентов и собранный дистрибутив агента — только локально.
+files/teamcity-agent/jdk/*
+files/teamcity-agent/build/

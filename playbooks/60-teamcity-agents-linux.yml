@@ -1,0 +1,445 @@
+---
+# ===========================================================================
+# 60 — Перенос Linux-агентов TeamCity на новый сервер (https).
+#
+# На каждом агенте запускается files/teamcity-agent/linux/teamcity-agent-linux-migrate.sh
+# (docs/teamcity-agent-linux-migrate.md): новый агент 2026 ставится РЯДОМ со старым
+# (/opt/buildAgent2026, служба teamcity-agent2026, Java 21 из пакета teamcity-agent-jdk21),
+# переносит параметры старого агента, штатно останавливает старого после текущей сборки
+# и выключает его автозапуск. Каталог старого агента не меняется; при сбое скрипт сам
+# возвращает старого агента.
+#
+# Плейбук добавляет:
+#   - https: в buildAgentFull.zip кладётся корпоративный УЦ (conf/trustedCertificates) —
+#     агент доверяет серверу сразу, Java не меняется; УЦ ставится и в систему (curl);
+#   - по одному агенту за раз: --check, затем перенос;
+#   - авторизация нового агента и пул старого агента (REST, нужен vault_teamcity_admin_token);
+#   - итог по каждому агенту.
+#
+# На агентах Python не нужен (Debian 9 тоже): только SSH (raw) и scp.
+#
+# Запуск (первый раз — с паролем root, плейбук разложит SSH-ключ):
+#   ansible-playbook playbooks/60-teamcity-agents-linux.yml --limit ba-deb12-01 \
+#     --ask-pass --ask-vault-pass -e agents_confirm=yes
+# Репетиция без остановки старых агентов: -e teamcity_agents_keep_old=true
+# ===========================================================================
+
+- name: Prepare agent distribution on control node
+  hosts: teamcity_agents_linux
+  gather_facts: false
+  vars:
+    agent_files: "{{ playbook_dir }}/../files/teamcity-agent"
+    agent_build: "{{ agent_files }}/build"
+    ca_file: "{{ playbook_dir }}/../files/ca/ca.crt"
+    tls_src_dir: "{{ playbook_dir }}/../files/tls"
+  tasks:
+    - name: Read inventory/vault.yml when present
+      ansible.builtin.include_vars:
+        file: "{{ inventory_dir }}/vault.yml"
+      when: query('fileglob', inventory_dir ~ '/vault.yml') | length > 0
+      no_log: true
+      run_once: true
+
+    - name: Require --limit and explicit confirmation
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - (agents_confirm | default('')) == 'yes' or (teamcity_agents_keep_old | default(false) | bool)
+        fail_msg: >-
+          Запускайте с --limit <агенты> и -e agents_confirm=yes: старые агенты будут остановлены
+          (после текущей сборки) и перестанут работать со старым сервером.
+          Репетиция без остановки старых агентов: -e teamcity_agents_keep_old=true.
+        quiet: true
+      run_once: true
+
+    - name: Server URL for agents (teamcity_agents_server_url or https://<TeamCity VM>)
+      ansible.builtin.assert:
+        that: (teamcity_agents_server_url | default('') | length > 0) or (groups['teamcity'] | default([]) | length > 0)
+        fail_msg: Задайте teamcity_agents_server_url (например, https://teamcity.inc.elara.local) или группу teamcity в inventory.
+        quiet: true
+      run_once: true
+
+    - name: Server URL for agents
+      ansible.builtin.set_fact:
+        agents_server_url: >-
+          {{ (teamcity_agents_server_url if (teamcity_agents_server_url | default('') | length > 0)
+              else 'https://' ~ (hostvars[groups['teamcity'][0]].teamcity_public_name | default(groups['teamcity'][0], true)))
+             | regex_replace('/+$', '') }}
+      run_once: true
+      delegate_to: localhost
+      delegate_facts: true
+
+    - name: Files on control node
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ agent_files }}/linux/teamcity-agent-linux-migrate.sh"
+        - "{{ ca_file }}"
+      register: agent_files_stat
+      delegate_to: localhost
+      run_once: true
+
+    - name: Require migration script and corporate CA
+      ansible.builtin.assert:
+        that: agent_files_stat.results | selectattr('stat.exists') | list | length == 2
+        fail_msg: >-
+          Нужны {{ agent_files }}/linux/teamcity-agent-linux-migrate.sh и {{ ca_file }}
+          (корпоративный УЦ — без него агенты не доверяют https сервера).
+        quiet: true
+      run_once: true
+
+    - name: Build directory
+      ansible.builtin.file:
+        path: "{{ agent_build }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      run_once: true
+
+    # Дистрибутив берётся с НОВОГО сервера: агент той же версии, что сервер.
+    # Новая версия сервера — новый архив: -e teamcity_agents_redownload=true.
+    - name: Download buildAgentFull.zip from the new server
+      ansible.builtin.uri:
+        url: "{{ hostvars['localhost'].agents_server_url }}/update/buildAgentFull.zip"
+        dest: "{{ agent_build }}/buildAgentFull.zip"
+        ca_path: "{{ ca_file }}"
+        mode: '0600'
+        creates: "{{ omit if (teamcity_agents_redownload | default(false) | bool) else agent_build ~ '/buildAgentFull.zip' }}"
+        timeout: 300
+      delegate_to: localhost
+      run_once: true
+
+    # conf/trustedCertificates — штатный способ TeamCity доверять серверу с сертификатом
+    # не от публичного УЦ (Uploading SSL Certificates). Кладём УЦ и сертификат сервера.
+    - name: Add corporate CA to the agent distribution (conf/trustedCertificates)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - -c
+          - |
+            import glob, os, ssl, sys, zipfile
+            src, dst, ca, tls_dir = sys.argv[1:5]
+            certs = {'conf/trustedCertificates/elara-ca.pem': open(ca, 'rb').read()}
+            for f in sorted(glob.glob(tls_dir + '/*.crt') + glob.glob(tls_dir + '/*.cer')
+                            + glob.glob(tls_dir + '/*.pem') + glob.glob(tls_dir + '/*.der'))[:1]:
+                data = open(f, 'rb').read()
+                if b'-----BEGIN CERTIFICATE-----' not in data:
+                    data = ssl.DER_cert_to_PEM_cert(data).encode()
+                certs['conf/trustedCertificates/teamcity-server.pem'] = data
+            with zipfile.ZipFile(src) as zin:
+                names = zin.namelist()
+                if not any(n.startswith('BUILD_') or '/BUILD_' in n for n in names):
+                    sys.exit('not a TeamCity agent distribution: ' + src)
+                # Уже собранный архив с теми же сертификатами не пересобираем.
+                if os.path.exists(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
+                    with zipfile.ZipFile(dst) as zold:
+                        if all(n in zold.namelist() and zold.read(n) == d for n, d in certs.items()):
+                            print('same'); sys.exit(0)
+                tmp = dst + '.tmp'
+                with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+                    for info in zin.infolist():
+                        if info.filename not in certs:
+                            zout.writestr(info, zin.read(info.filename))
+                    for n, d in certs.items():
+                        zi = zipfile.ZipInfo(n, date_time=(2020, 1, 1, 0, 0, 0))
+                        zi.external_attr = 0o644 << 16
+                        zout.writestr(zi, d)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, dst)
+            print('changed')
+          - "{{ agent_build }}/buildAgentFull.zip"
+          - "{{ agent_build }}/buildAgentFull-https.zip"
+          - "{{ ca_file }}"
+          - "{{ tls_src_dir }}"
+      register: agent_zip
+      changed_when: "'changed' in agent_zip.stdout"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Checksums of files for agents
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop: >-
+        {{ [agent_files ~ '/linux/teamcity-agent-linux-migrate.sh', agent_build ~ '/buildAgentFull-https.zip', ca_file]
+           + query('fileglob', agent_files ~ '/jdk/teamcity-agent-jdk21_*.deb') }}
+      register: agent_src_sums
+      delegate_to: localhost
+      run_once: true
+
+- name: Migrate Linux agents to the new server
+  hosts: teamcity_agents_linux
+  gather_facts: false
+  serial: "{{ teamcity_agents_serial | default(1) }}"
+  vars:
+    agent_files: "{{ playbook_dir }}/../files/teamcity-agent"
+    agent_build: "{{ agent_files }}/build"
+    ca_file: "{{ playbook_dir }}/../files/ca/ca.crt"
+    work_dir: /root/teamcity-agent-migrate
+    server_url: "{{ hostvars['localhost'].agents_server_url }}"
+    old_dir: "{{ teamcity_agent_old_dir | default('/opt/buildAgent', true) }}"
+    new_dir: /opt/buildAgent2026
+    ssh_pubkey_path: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+    ssh_privkey_path: "{{ ssh_pubkey_path | regex_replace('\\.pub$', '') }}"
+    src_sums: "{{ hostvars[ansible_play_hosts_all[0]].agent_src_sums.results | default([]) }}"
+    script_args: >-
+      --server {{ server_url | quote }} --zip {{ (work_dir ~ '/buildAgentFull-https.zip') | quote }}
+      --old-dir {{ old_dir | quote }}
+      {{ ('--user ' ~ (teamcity_agent_user | quote)) if (teamcity_agent_user | default('') | length > 0) else '' }}
+      {{ '--keep-old' if (teamcity_agents_keep_old | default(false) | bool) else '' }}
+  tasks:
+    - name: Read inventory/vault.yml when present
+      ansible.builtin.include_vars:
+        file: "{{ inventory_dir }}/vault.yml"
+      when: query('fileglob', inventory_dir ~ '/vault.yml') | length > 0
+      no_log: true
+
+    # --- 1. Доступ ------------------------------------------------------------
+    - name: "1a. Вход под root"
+      ansible.builtin.raw: id -u
+      register: agent_uid
+      changed_when: false
+      failed_when: agent_uid.rc != 0 or (agent_uid.stdout | trim) != '0'
+
+    - name: "1b. SSH-ключ control node для root (дальше — без пароля)"
+      ansible.builtin.raw: |
+        set -e
+        key={{ lookup('file', ssh_pubkey_path) | quote }}
+        mkdir -p /root/.ssh && chmod 700 /root/.ssh
+        touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
+        if grep -qxF "$key" /root/.ssh/authorized_keys; then echo same; else printf '%s\n' "$key" >> /root/.ssh/authorized_keys; echo changed; fi
+      register: agent_key
+      changed_when: "'changed' in agent_key.stdout"
+
+    # --- 2. Система и пакет Java ---------------------------------------------
+    - name: "2a. Система: dpkg и версия libc6"
+      ansible.builtin.raw: |
+        command -v dpkg-query >/dev/null 2>&1 || { echo NODPKG; exit 0; }
+        dpkg-query -W -f='${Version}' libc6 2>/dev/null || echo NOLIBC
+      register: agent_libc
+      changed_when: false
+
+    - name: "2b. Только Debian/Ubuntu/Astra (dpkg)"
+      ansible.builtin.assert:
+        that: agent_libc.stdout | trim is match('^[0-9]')
+        fail_msg: >-
+          {{ inventory_hostname }}: нет dpkg/libc6 ({{ agent_libc.stdout | trim }}) — это не Debian-система
+          (например, ROSA). Пакет Java teamcity-agent-jdk21 сюда не ставится: перенесите агента вручную.
+        quiet: true
+
+    # libc6 >= 2.36 (Debian 12+) — обычный пакет, старше — пакет ~deb9 (та же Java).
+    - name: "2c. Подходящий пакет Java 21"
+      ansible.builtin.set_fact:
+        agent_deb: >-
+          {{ src_sums | map(attribute='stat') | selectattr('exists') | map(attribute='path')
+             | select('search', '/teamcity-agent-jdk21_[^/]*' ~ ('~deb9' if (old_libc | bool) else '[0-9]-[0-9]+_') ~ '[^/]*amd64[.]deb$')
+             | list | first | default('') }}
+      vars:
+        old_libc: "{{ not (((agent_libc.stdout | trim).split('-')[0]) is version('2.36', '>=')) }}"
+
+    - name: "2d. Пакет Java 21 есть на control node"
+      ansible.builtin.assert:
+        that: agent_deb | length > 0
+        fail_msg: >-
+          Нет пакета Java для libc6 {{ agent_libc.stdout | trim }} в files/teamcity-agent/jdk/:
+          нужен teamcity-agent-jdk21_*{{ '~deb9' if not (((agent_libc.stdout | trim).split('-')[0]) is version('2.36', '>=')) else '' }}_amd64.deb
+          (см. files/teamcity-agent/README.md).
+        quiet: true
+
+    # --- 3. Файлы на агенте ----------------------------------------------------
+    - name: "3a. Рабочий каталог {{ work_dir }}"
+      ansible.builtin.raw: |
+        set -e
+        mkdir -p {{ work_dir }} && chown root:root {{ work_dir }} && chmod 700 {{ work_dir }}
+        # Только нужный пакет Java: скрипт берёт новейший .deb рядом с собой.
+        for f in {{ work_dir }}/teamcity-agent-jdk21_*.deb; do
+          [ -e "$f" ] || continue
+          [ "$(basename "$f")" = {{ agent_deb | basename | quote }} ] || rm -f "$f"
+        done
+        cd {{ work_dir }} && sha256sum teamcity-agent-linux-migrate.sh buildAgentFull-https.zip elara-ca.crt {{ agent_deb | basename | quote }} 2>/dev/null || true
+      register: agent_remote_sums
+      changed_when: false
+
+    - name: "3b. Копирование изменившихся файлов (scp)"
+      ansible.builtin.command:
+        argv:
+          - scp
+          - -q
+          - -i
+          - "{{ ssh_privkey_path }}"
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=accept-new
+          - -P
+          - "{{ ansible_port | default(22) }}"
+          - "{{ item.src }}"
+          - "root@{{ ansible_host | default(inventory_hostname) }}:{{ work_dir }}/{{ item.dest }}"
+      loop: >-
+        {{ [{'src': agent_files ~ '/linux/teamcity-agent-linux-migrate.sh', 'dest': 'teamcity-agent-linux-migrate.sh'},
+            {'src': agent_build ~ '/buildAgentFull-https.zip', 'dest': 'buildAgentFull-https.zip'},
+            {'src': ca_file, 'dest': 'elara-ca.crt'},
+            {'src': agent_deb, 'dest': agent_deb | basename}] }}
+      loop_control:
+        label: "{{ item.dest }}"
+      when: >-
+        ((src_sums | selectattr('stat.path', 'equalto', item.src) | map(attribute='stat.checksum') | first | default('x'))
+          ~ '  ' ~ item.dest) not in (agent_remote_sums.stdout_lines | map('trim') | list)
+      delegate_to: localhost
+      changed_when: true
+
+    # curl в скрипте проверяет сервер по https — система должна доверять УЦ.
+    - name: "3c. Корпоративный УЦ в системе агента"
+      ansible.builtin.raw: |
+        set -e
+        dst=/usr/local/share/ca-certificates/elara-teamcity-ca.crt
+        if [ -f "$dst" ] && cmp -s {{ work_dir }}/elara-ca.crt "$dst"; then echo same; exit 0; fi
+        command -v update-ca-certificates >/dev/null 2>&1 || { echo "нет update-ca-certificates (пакет ca-certificates)"; exit 1; }
+        mkdir -p /usr/local/share/ca-certificates
+        install -m 0644 {{ work_dir }}/elara-ca.crt "$dst"
+        update-ca-certificates >/dev/null
+        echo changed
+      register: agent_ca
+      changed_when: "'changed' in agent_ca.stdout"
+
+    # --- 4. Проверка и перенос -------------------------------------------------
+    - name: "4a. Проверка (--check): чего не хватает и план"
+      ansible.builtin.raw: cd {{ work_dir }} && bash ./teamcity-agent-linux-migrate.sh --check {{ script_args }}
+      register: agent_check
+      changed_when: false
+      failed_when: false
+
+    - name: "4b. Результат проверки"
+      ansible.builtin.debug:
+        msg: "{{ agent_check.stdout_lines }}"
+      when: agent_check.rc != 0 or (teamcity_agents_verbose | default(false) | bool)
+
+    - name: "4c. Проверка без блокирующих замечаний"
+      ansible.builtin.assert:
+        that: agent_check.rc == 0
+        fail_msg: >-
+          {{ inventory_hostname }}: скрипт нашёл, что мешает переносу (пункты [НЕТ] выше), код {{ agent_check.rc }}.
+          Ничего не изменено. Исправьте и запустите плейбук снова для этого агента.
+        quiet: true
+
+    - name: "4d. Перенос агента (ждёт окончания текущей сборки до {{ teamcity_agents_wait | default(600) }} с)"
+      ansible.builtin.raw: >-
+        cd {{ work_dir }} && bash ./teamcity-agent-linux-migrate.sh --yes {{ script_args }}
+        --wait {{ teamcity_agents_wait | default(600) | int }}
+      register: agent_migrate
+      changed_when: "agent_migrate.rc == 0 and 'Ничего делать не нужно' not in agent_migrate.stdout"
+      failed_when: false
+
+    - name: "4e. Вывод скрипта переноса"
+      ansible.builtin.debug:
+        msg: "{{ agent_migrate.stdout_lines[-40:] }}"
+      when: agent_migrate.rc != 0 or (teamcity_agents_verbose | default(false) | bool)
+
+    - name: "4f. Перенос выполнен (код 3 — идёт сборка, ничего не прервано)"
+      ansible.builtin.assert:
+        that: agent_migrate.rc in [0, 3]
+        fail_msg: >-
+          {{ inventory_hostname }}: перенос не удался (код {{ agent_migrate.rc }}). Скрипт вернул старого агента;
+          подробности — вывод выше. Удалить нового агента: bash {{ work_dir }}/... или
+          files/teamcity-agent/linux/teamcity-agent-linux-remove-new.sh.
+        quiet: true
+
+    # --- 5. Авторизация и пул --------------------------------------------------
+    - name: "5a. Имена старого и нового агента"
+      ansible.builtin.raw: |
+        sed -n 's/^[[:space:]]*name[[:space:]]*[=:][[:space:]]*//p' {{ (old_dir ~ '/conf/buildAgent.properties') | quote }} 2>/dev/null | tail -n 1
+        echo '|'
+        sed -n 's/^[[:space:]]*name[[:space:]]*[=:][[:space:]]*//p' {{ new_dir }}/conf/buildAgent.properties 2>/dev/null | tail -n 1
+      register: agent_names
+      changed_when: false
+      when: agent_migrate.rc == 0
+
+    - name: "5b. Авторизация и пул в TeamCity"
+      when:
+        - agent_migrate.rc == 0
+        - vault_teamcity_admin_token | default('') | length > 0
+      vars:
+        old_name: "{{ (agent_names.stdout.split('|')[0]) | trim }}"
+        new_name: "{{ (agent_names.stdout.split('|')[1]) | trim }}"
+        rest_headers:
+          Authorization: "Bearer {{ vault_teamcity_admin_token }}"
+          Accept: application/json
+      block:
+        - name: "5b-1. Новый агент зарегистрировался на сервере"
+          ansible.builtin.uri:
+            url: "{{ server_url }}/app/rest/agents?locator={{ ('name:' ~ new_name ~ ',authorized:any,connected:any') | urlencode }}&fields=agent(id,name,authorized,pool(id,name))"
+            headers: "{{ rest_headers }}"
+            ca_path: "{{ ca_file }}"
+          register: rest_new
+          until: (rest_new.json.agent | default([])) | length > 0
+          retries: 18
+          delay: 10
+          delegate_to: localhost
+          no_log: "{{ not (teamcity_agents_verbose | default(false) | bool) }}"
+
+        - name: "5b-2. Пул старого агента"
+          ansible.builtin.uri:
+            url: "{{ server_url }}/app/rest/agents?locator={{ ('name:' ~ old_name ~ ',authorized:any,connected:any') | urlencode }}&fields=agent(id,name,pool(id,name))"
+            headers: "{{ rest_headers }}"
+            ca_path: "{{ ca_file }}"
+          register: rest_old
+          delegate_to: localhost
+          no_log: "{{ not (teamcity_agents_verbose | default(false) | bool) }}"
+
+        - name: "5b-3. Авторизовать нового агента"
+          ansible.builtin.uri:
+            url: "{{ server_url }}/app/rest/agents/id:{{ rest_new.json.agent[0].id }}/authorizedInfo"
+            method: PUT
+            headers: "{{ rest_headers }}"
+            body_format: json
+            body:
+              status: true
+              comment:
+                text: "Migrated from {{ old_name }} by ansible (60-teamcity-agents-linux)"
+            ca_path: "{{ ca_file }}"
+          when: not (rest_new.json.agent[0].authorized | default(false) | bool)
+          changed_when: true
+          delegate_to: localhost
+          no_log: "{{ not (teamcity_agents_verbose | default(false) | bool) }}"
+
+        - name: "5b-4. В пул старого агента"
+          ansible.builtin.uri:
+            url: "{{ server_url }}/app/rest/agentPools/id:{{ old_pool.id }}/agents"
+            method: POST
+            headers: "{{ rest_headers }}"
+            body_format: json
+            body: "{{ {'id': rest_new.json.agent[0].id | int} | to_json }}"
+            ca_path: "{{ ca_file }}"
+          vars:
+            old_pool: "{{ (rest_old.json.agent | default([]) | first | default({})).pool | default({}) }}"
+          when:
+            - old_pool.id is defined
+            - old_pool.id | string != (rest_new.json.agent[0].pool.id | default('') | string)
+          changed_when: true
+          delegate_to: localhost
+          no_log: "{{ not (teamcity_agents_verbose | default(false) | bool) }}"
+
+        - name: "5b-5. Агент в TeamCity"
+          ansible.builtin.set_fact:
+            agent_rest_result: >-
+              {{ new_name }}: авторизован, пул
+              {{ ((rest_old.json.agent | default([]) | first | default({})).pool | default({})).name
+                 | default('по умолчанию (старый агент ' ~ old_name ~ ' на сервере не найден)') }}
+
+    - name: "6. Итог по агенту"
+      ansible.builtin.set_fact:
+        agent_summary: >-
+          {{ {0: 'перенесён', 3: 'ЖДЁТ СБОРКУ — запустите плейбук для него позже'}[agent_migrate.rc] | default('ошибка') }}
+          {{ ('; ' ~ agent_rest_result) if agent_rest_result is defined else
+             ('; авторизуйте в TeamCity вручную (нет vault_teamcity_admin_token)'
+              if agent_migrate.rc == 0 and (vault_teamcity_admin_token | default('') | length == 0) else '') }}
+
+- name: Summary
+  hosts: teamcity_agents_linux
+  gather_facts: false
+  tasks:
+    - name: Итог переноса агентов
+      ansible.builtin.debug:
+        msg: "{{ ansible_play_hosts_all | map('extract', hostvars) | map(attribute='inventory_hostname') | zip(ansible_play_hosts_all | map('extract', hostvars) | map(attribute='agent_summary', default='не обработан: ошибка выше')) | map('join', ': ') | list }}"
+      run_once: true
