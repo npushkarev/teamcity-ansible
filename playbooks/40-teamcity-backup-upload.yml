@@ -62,9 +62,18 @@
       run_once: true
 
     - name: Check rsync on control node
-      ansible.builtin.command: rsync --version
+      ansible.builtin.shell: command -v rsync
+      register: migration_rsync
       changed_when: false
+      failed_when: false
       delegate_to: localhost
+      run_once: true
+
+    - name: Require rsync on control node
+      ansible.builtin.assert:
+        that: migration_rsync.rc == 0
+        fail_msg: "На этой машине (control node) нет rsync. Установите: sudo apt install -y rsync — и запустите плейбук снова."
+        quiet: true
       run_once: true
 
     # --- 2. Место и rsync на ВМ ----------------------------------------------
