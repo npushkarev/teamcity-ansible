@@ -18,7 +18,7 @@ teamcity_image_source: offline
 teamcity_registry: proget.inc.elara.local/main/library
 teamcity_registry_server_image: "{{ teamcity_registry }}/teamcity-server:{{ teamcity_version }}-unlimited"
 teamcity_registry_agent_image: "{{ teamcity_registry }}/teamcity-minimal-agent:{{ teamcity_version }}"
-teamcity_registry_db_image: "{{ teamcity_registry }}/postgres:16-alpine"
+teamcity_registry_db_image: "{{ teamcity_registry }}/postgres:16"
 teamcity_registry_user: "{{ vault_proget_registry_user | default('') }}"
 teamcity_registry_password: "{{ vault_proget_registry_password | default('') }}"
 teamcity_registry_host: "{{ teamcity_registry_server_image.split('/')[0] }}"

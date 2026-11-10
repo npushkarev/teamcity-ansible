@@ -22,7 +22,7 @@
 - **Образы в ProGet:**
   ```text
   proget.inc.elara.local/main/library/teamcity-server:2026.2-unlimited
-  proget.inc.elara.local/main/library/postgres:16-alpine
+  proget.inc.elara.local/main/library/postgres:16
   ```
 
 ## 1. Подготовить ВМ в vSphere
