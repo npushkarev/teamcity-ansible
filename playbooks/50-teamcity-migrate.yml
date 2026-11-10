@@ -17,8 +17,8 @@
 # Запуск (после 00 и 01):
 #   ansible-playbook playbooks/50-teamcity-migrate.yml --limit <ВМ> --ask-vault-pass
 #
-# Лицензионное соглашение TeamCity 2026: teamcity_accept_license_agreement: true
-# в hosts.yml — плейбук принимает его сам; иначе подскажет, как принять в браузере.
+# Лицензионное соглашение TeamCity 2026 плейбук принимает сам (запуская его, вы принимаете
+# TeamCity License Agreement). Принимать в браузере: teamcity_accept_license_agreement: false.
 #
 # Повторный запуск безопасен: восстановление (/opt/teamcity-2026/.restored) и первый
 # запуск (.upgraded) выполняются один раз; оборвавшийся запуск продолжится с места
@@ -551,7 +551,7 @@
           retries: "{{ start_wait_retries }}"
           delay: "{{ start_wait_delay }}"
 
-        # teamcity_accept_license_agreement: true — тот, кто запускает плейбук, принимает
+        # По умолчанию (teamcity_accept_license_agreement не false) тот, кто запускает плейбук, принимает
         # TeamCity License Agreement (как кнопка «Accept» на странице обслуживания).
         # Вход — по токену Super user из журнала сервера; токен не выводится.
         - name: "6e. Принять лицензионное соглашение TeamCity (teamcity_accept_license_agreement)"
@@ -573,7 +573,7 @@
           changed_when: true
           when:
             - "'license agreement' in tc_up.stdout"
-            - teamcity_accept_license_agreement | default(false) | bool
+            - teamcity_accept_license_agreement | default(true) | bool
 
         - name: "6e. НУЖНО ДЕЙСТВИЕ: принять лицензионное соглашение TeamCity в браузере"
           ansible.builtin.debug:
@@ -583,10 +583,10 @@
               - "2. Войдите как Super user. Токен — на ВМ:"
               - "   docker compose -f {{ tc_dir }}/compose.yaml logs server | grep 'Super user authentication token' | tail -n 1"
               - "3. Примите соглашение. Дальше обновление данных пойдёт само, плейбук ждёт до часа."
-              - "Чтобы принимать автоматически: teamcity_accept_license_agreement: true в hosts.yml."
+              - "Чтобы принимать автоматически, уберите teamcity_accept_license_agreement: false."
           when:
             - "'license agreement' in tc_up.stdout"
-            - not (teamcity_accept_license_agreement | default(false) | bool)
+            - not (teamcity_accept_license_agreement | default(true) | bool)
 
         - name: "6f. Ждём, пока TeamCity обновит данные и запустится"
           ansible.builtin.shell: |

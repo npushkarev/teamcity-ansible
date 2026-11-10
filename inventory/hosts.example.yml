@@ -25,7 +25,6 @@ all:
         teamcity_start_containers: false
         # Каталог на ВМ с TeamCity_Backup.zip; внутри контейнера виден как /migration (только чтение).
         teamcity_migration_staging_dir: /srv/teamcity-migration
-        # 50: после восстановления TeamCity 2026 просит принять лицензионное соглашение.
-        # true — плейбук принимает его сам (https://www.jetbrains.com/legal/docs/teamcity/license/):
-        # запуская 50, вы принимаете TeamCity License Agreement. false — принять в браузере.
-        teamcity_accept_license_agreement: true
+        # 50 сам принимает лицензионное соглашение TeamCity 2026
+        # (https://www.jetbrains.com/legal/docs/teamcity/license/). Принимать в браузере:
+        # teamcity_accept_license_agreement: false

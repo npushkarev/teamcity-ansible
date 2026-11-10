@@ -112,11 +112,11 @@ ansible-playbook playbooks/50-teamcity-migrate.yml --limit $H --ask-vault-pass
 3. Docker, образы из ProGet, `/opt/teamcity-2026/compose.yaml` (как `53`). TeamCity слушает только `127.0.0.1:8111`.
 4. **https**: nginx на 443 с сертификатом из `files/tls/`, `http` → `https`. Проверяется, что ключ подходит к сертификату, сертификат не просрочен и подходит к имени ВМ.
 5. **Восстановление** backup в PostgreSQL (`maintainDB restore`), артефакты, адрес сервера `https://<имя ВМ>`.
-6. **Первый запуск**: TeamCity принимает лицензионное соглашение (если `teamcity_accept_license_agreement: true`), обновляет данные 2018 → 2026 без ручного подтверждения и перезапускается в обычном режиме.
+6. **Первый запуск**: принимается лицензионное соглашение TeamCity, данные обновляются 2018 → 2026 без ручного подтверждения, сервер перезапускается в обычном режиме.
 
 Итог: `https://deb-13-test-teamcity.inc.elara.local`, вход — пользователями старого сервера. Обновление данных **необратимо** для этой ВМ; старый сервер не затрагивается.
 
-`teamcity_accept_license_agreement: true` в `hosts.yml` означает, что, запуская `50`, вы принимаете [TeamCity License Agreement](https://www.jetbrains.com/legal/docs/teamcity/license/). С `false` плейбук остановится на ожидании и напишет, как принять соглашение в браузере, затем продолжит сам.
+Запуская `50`, вы принимаете [TeamCity License Agreement](https://www.jetbrains.com/legal/docs/teamcity/license/): плейбук принимает его сам. Если нужно принимать в браузере — `teamcity_accept_license_agreement: false` в `hosts.yml`: плейбук остановится на ожидании, подскажет, что сделать, и продолжит сам.
 
 Повторный запуск безопасен: восстановление (`/opt/teamcity-2026/.restored`) и первый запуск (`.upgraded`) выполняются один раз; если прошлый запуск оборвался — продолжит с места остановки. Тома Docker плейбук не удаляет. Если восстановление упало, журнал — `/opt/teamcity-2026/restore.log`, а плейбук подскажет, как начать заново.
 
