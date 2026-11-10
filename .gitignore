@@ -8,3 +8,7 @@ inventory/host_vars/
 .fact_cache/
 collections/
 .DS_Store
+
+# Backup старого TeamCity — только локально.
+migration/*
+!migration/README.md

@@ -6,6 +6,7 @@
 |---|---|
 | `00-bootstrap-keys.yml` | hostname, `/etc/hosts`, прокси apt, Python, время (chrony), базовые пакеты, сертификат УЦ и ProGet в apt, SSH-ключ control node |
 | `01-expand-root.yml` | растягивает корень `/` на весь диск, swap-раздел заменяет файлом `/swapfile` |
+| `40-teamcity-backup-upload.yml` | переносит backup и артефакты старого TeamCity из `migration/` на ВМ (rsync, докачка, проверка SHA-256) |
 | `53-teamcity-proget.yml` | Docker и Compose v2 из Debian, настройки Docker, образы из ProGet, Compose. При переносе (по умолчанию) TeamCity **не запускается** |
 
 Локальный build agent не создаётся: сборки выполняет внешний агент.
@@ -78,16 +79,23 @@ ansible-playbook playbooks/01-expand-root.yml --limit $H -e expand_root_confirm=
   <TeamCity Home>/bin/maintainDB.sh backup -C -D -L -P -U -A <Data Directory> -F TeamCity_Backup
   ```
 
-**Артефакты сборок в ZIP не входят**: скопируйте отдельно `<Data Directory>/system/artifacts`.
+**Артефакты сборок в ZIP не входят**: их нужно взять отдельно из `<Data Directory>/system/artifacts`. UI-backup лежит на старом сервере в `<Data Directory>/backup/`.
 
-На новой ВМ:
+Положите всё в папку `migration/` проекта на control node (в git она не попадает):
+
+```text
+migration/
+├── TeamCity_Backup.zip   ← backup (переименуйте файл в это имя)
+└── artifacts/            ← содержимое <Data Directory>/system/artifacts
+```
+
+и перенесите на ВМ (нужен `rsync` на control node: `sudo apt install rsync`):
 
 ```bash
-mkdir -p /srv/teamcity-migration
-# положить сюда TeamCity_Backup.zip и каталог artifacts/
-chown -R 1000:1000 /srv/teamcity-migration   # TeamCity в контейнере работает под UID 1000
-chmod 700 /srv/teamcity-migration            # в ZIP есть пароли и токены
+ansible-playbook playbooks/40-teamcity-backup-upload.yml --limit $H
 ```
+
+Плейбук проверит свободное место, скопирует всё в `/srv/teamcity-migration` по rsync и сверит SHA-256 архива. Права выставляются сразу: `1000:1000` (пользователь TeamCity в контейнере), `0700`/`0600` (в ZIP есть пароли и токены). При обрыве просто запустите его ещё раз: он докачает только недостающее. На ВМ он ничего не удаляет.
 
 ## 5. Подготовить TeamCity без запуска
 

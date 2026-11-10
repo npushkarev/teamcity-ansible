@@ -1,0 +1,141 @@
+---
+# ===========================================================================
+# 40 — Перенести backup старого TeamCity с control node на новую ВМ.
+#
+# Источник на control node — каталог migration/ рядом с playbooks/ (в git не попадает):
+#   migration/TeamCity_Backup.zip   — backup старого TeamCity (обязательно)
+#   migration/artifacts/            — <Data Directory>/system/artifacts (если есть)
+# Назначение на ВМ — teamcity_migration_staging_dir (по умолчанию /srv/teamcity-migration),
+# внутри контейнера TeamCity он виден как /migration.
+#
+# rsync поверх SSH: при обрыве докачивает, при повторном запуске пропускает уже
+# скопированное. На ВМ ничего не удаляет. Права: 1000:1000 (пользователь TeamCity
+# в контейнере), каталоги 0700, файлы 0600 — в ZIP есть пароли и токены.
+#
+# Нужно: rsync на control node (sudo apt install rsync) и на ВМ (ставит 00).
+#
+# Запуск (после 00 и 01, до 53):
+#   ansible-playbook playbooks/40-teamcity-backup-upload.yml --limit <ВМ>
+# ===========================================================================
+- name: Upload old TeamCity backup to the new server
+  hosts: teamcity
+  gather_facts: false
+  vars:
+    migration_source_dir: "{{ teamcity_migration_source_dir | default((playbook_dir | dirname) ~ '/migration', true) }}"
+    migration_dest_dir: "{{ teamcity_migration_staging_dir | default('/srv/teamcity-migration', true) }}"
+    migration_backup_name: "{{ teamcity_migration_backup_name | default('TeamCity_Backup.zip', true) }}"
+  tasks:
+    - name: Require --limit to avoid touching other hosts
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: Run with --limit <host> so other machines are not changed.
+        quiet: true
+      run_once: true
+
+    # --- 1. Источник на control node ----------------------------------------
+    - name: Check backup archive on control node
+      ansible.builtin.stat:
+        path: "{{ migration_source_dir }}/{{ migration_backup_name }}"
+        checksum_algorithm: sha256
+      register: migration_src_zip
+      delegate_to: localhost
+      run_once: true
+
+    - name: Require backup archive on control node
+      ansible.builtin.assert:
+        that:
+          - migration_src_zip.stat.exists
+          - migration_src_zip.stat.isreg
+          - migration_src_zip.stat.size > 0
+        fail_msg: >-
+          Нет {{ migration_source_dir }}/{{ migration_backup_name }}. Положите туда backup
+          старого TeamCity (переименуйте в {{ migration_backup_name }}), артефакты — в
+          {{ migration_source_dir }}/artifacts/.
+        quiet: true
+      run_once: true
+
+    - name: Size of data to upload
+      ansible.builtin.command: du -sk {{ migration_source_dir | quote }}
+      register: migration_src_du
+      changed_when: false
+      delegate_to: localhost
+      run_once: true
+
+    - name: Check rsync on control node
+      ansible.builtin.command: rsync --version
+      changed_when: false
+      delegate_to: localhost
+      run_once: true
+
+    # --- 2. Место и rsync на ВМ ----------------------------------------------
+    - name: Ensure rsync on the server
+      ansible.builtin.apt:
+        name: rsync
+        state: present
+
+    - name: Create migration directory
+      ansible.builtin.file:
+        path: "{{ migration_dest_dir }}"
+        state: directory
+        owner: '1000'
+        group: '1000'
+        mode: '0700'
+
+    - name: Free space and already uploaded data on the server
+      ansible.builtin.shell: |
+        set -eu
+        df -Pk {{ migration_dest_dir | quote }} | awk 'NR==2 {print $4}'
+        du -sk {{ migration_dest_dir | quote }} | cut -f1
+      register: migration_dest_space
+      changed_when: false
+
+    # Нужно место под ещё не скопированное; восстановление позже займёт примерно
+    # столько же ещё (база и Data Directory), поэтому отдельно предупреждаем.
+    - name: Require enough free space for the upload
+      ansible.builtin.assert:
+        that: >-
+          (migration_dest_space.stdout_lines[0] | int) >
+          ((migration_src_du.stdout.split()[0] | int) - (migration_dest_space.stdout_lines[1] | int)) * 1.05
+        fail_msg: >-
+          Мало места на ВМ: нужно ~{{ ((migration_src_du.stdout.split()[0] | int) / 1048576) | round(2) }} ГБ,
+          свободно {{ ((migration_dest_space.stdout_lines[0] | int) / 1048576) | round(1) }} ГБ.
+          Увеличьте диск в vSphere и выполните 01-expand-root.
+        success_msg: >-
+          Копируется ~{{ ((migration_src_du.stdout.split()[0] | int) / 1048576) | round(2) }} ГБ,
+          свободно {{ ((migration_dest_space.stdout_lines[0] | int) / 1048576) | round(1) }} ГБ.
+          Для восстановления понадобится примерно столько же ещё.
+
+    # --- 3. Копирование -------------------------------------------------------
+    - name: Upload backup and artifacts with rsync (resumable)
+      ansible.posix.synchronize:
+        src: "{{ migration_source_dir }}/"
+        dest: "{{ migration_dest_dir }}/"
+        archive: true
+        delete: false
+        rsync_opts:
+          - --partial
+          - --exclude=/README.md
+          - --chown=1000:1000
+          - --chmod=D0700,F0600
+
+    # --- 4. Проверка ------------------------------------------------------------
+    - name: Checksum of the uploaded archive
+      ansible.builtin.stat:
+        path: "{{ migration_dest_dir }}/{{ migration_backup_name }}"
+        checksum_algorithm: sha256
+      register: migration_dest_zip
+
+    - name: Uploaded archive matches the source
+      ansible.builtin.assert:
+        that:
+          - migration_dest_zip.stat.exists
+          - migration_dest_zip.stat.checksum == migration_src_zip.stat.checksum
+        fail_msg: SHA-256 архива на ВМ не совпадает с исходным. Запустите плейбук ещё раз.
+        quiet: true
+
+    - name: Upload summary
+      ansible.builtin.debug:
+        msg: |
+          Backup на ВМ: {{ migration_dest_dir }}/{{ migration_backup_name }} (SHA-256 совпадает)
+          В контейнере TeamCity: /migration/{{ migration_backup_name }}
+          Дальше: ansible-playbook playbooks/53-teamcity-proget.yml --limit {{ inventory_hostname }} --ask-vault-pass
