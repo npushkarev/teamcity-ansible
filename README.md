@@ -1,13 +1,14 @@
 # TeamCity 2026.2 на Debian 13 из ProGet с переносом данных
 
-Три плейбука готовят новую ВМ и TeamCity Server с PostgreSQL 16 в Docker, куда затем восстанавливаются данные старого TeamCity 2018.1.3 (проекты, пользователи, история, артефакты):
+Новая ВМ с TeamCity Server и PostgreSQL 16 в Docker, данные старого TeamCity 2018.1.3 (проекты, пользователи, история, артефакты) и https. Подготовка ВМ — `00` и `01`, всё остальное — **одна команда** `50`:
 
 | Плейбук | Что делает |
 |---|---|
 | `00-bootstrap-keys.yml` | hostname, `/etc/hosts`, прокси apt, Python, время (chrony), базовые пакеты, сертификат УЦ и ProGet в apt, SSH-ключ control node |
 | `01-expand-root.yml` | растягивает корень `/` на весь диск, swap-раздел заменяет файлом `/swapfile` |
-| `40-teamcity-backup-upload.yml` | переносит backup и артефакты старого TeamCity из `migration/` на ВМ (rsync, докачка, проверка SHA-256) |
-| `53-teamcity-proget.yml` | Docker и Compose v2 из Debian, настройки Docker, образы из ProGet, Compose. При переносе (по умолчанию) TeamCity **не запускается** |
+| **`50-teamcity-migrate.yml`** | **всё остальное**: `40` + `53` + https на nginx + восстановление backup + обновление данных 2018 → 2026 + запуск |
+| `40-teamcity-backup-upload.yml` | (часть `50`) переносит backup и артефакты из `migration/` на ВМ: rsync, докачка, проверка SHA-256 |
+| `53-teamcity-proget.yml` | (часть `50`) Docker и Compose v2 из Debian, настройки Docker, образы из ProGet, `compose.yaml` |
 
 Локальный build agent не создаётся: сборки выполняет внешний агент.
 
@@ -17,6 +18,7 @@
 - **Control node** — машина с Ansible и сетевым доступом к ВМ. Запускать от своего пользователя, без `sudo`.
 - **SSH-ключ** `~/.ssh/id_ed25519` (создать: `ssh-keygen -t ed25519`).
 - **Корневой сертификат УЦ** в `files/ca/ca.crt` (см. `files/ca/README.md`).
+- **Сертификат для https** — wildcard `*.inc.elara.local`: `files/tls/inc.elara.local.cer` и `files/tls/inc.elara.local.key` (см. `files/tls/README.md`).
 - **Образы в ProGet:**
   ```text
   proget.inc.elara.local/main/library/teamcity-server:2026.2-unlimited
@@ -48,7 +50,7 @@ openssl rand -hex 24                                    # пароль PostgreSQ
 ansible-vault encrypt inventory/vault.yml
 ```
 
-`inventory/hosts.yml` и `inventory/vault.yml` в git не попадают. Оба плейбука, `00` и `53`, читают один и тот же `vault.yml`.
+`inventory/hosts.yml` и `inventory/vault.yml` в git не попадают. Все плейбуки (`00`, `50`, `53`) читают один и тот же `vault.yml`.
 
 ## 3. Подготовить ВМ
 
@@ -69,72 +71,65 @@ ansible-playbook playbooks/01-expand-root.yml --limit $H -e expand_root_confirm=
 - нет `ca.crt` — добавьте `-e bootstrap_proget_enabled=false`, а в `hosts.yml` поставьте `teamcity_registry_insecure: true`;
 - время уже выставлено и NTP недоступен — добавьте `-e bootstrap_time_sync=false`.
 
-## 4. Backup старого TeamCity и копирование на ВМ
+## 4. Backup старого TeamCity
 
 Старый сервер при этом **не меняется** и остаётся точкой отката.
 
-- **Репетиция** — без остановки: **Administration → Backup**, scope *Custom*: база, настройки, логи сборок, personal changes.
+- **Репетиция** — без остановки: **Administration → Backup**, scope *Custom*: база, настройки, логи сборок, personal changes. Файл появится в `<Data Directory>/backup/` (на текущем сервере — `/data/teamcity-data/backup/`).
 - **Финальный перенос** — в окно простоя: дождаться завершения сборок, остановить сервер и сделать backup той же версией 2018.1.3:
   ```bash
   <TeamCity Home>/bin/maintainDB.sh backup -C -D -L -P -U -A <Data Directory> -F TeamCity_Backup
   ```
 
-**Артефакты сборок в ZIP не входят**: их нужно взять отдельно из `<Data Directory>/system/artifacts`. UI-backup лежит на старом сервере в `<Data Directory>/backup/`.
-
-Положите всё в папку `migration/` проекта на control node (в git она не попадает):
+Положите на control node (в git не попадает):
 
 ```text
-migration/
-├── TeamCity_Backup.zip   ← backup (переименуйте файл в это имя)
-└── artifacts/            ← содержимое <Data Directory>/system/artifacts
+migration/TeamCity_Backup.zip   ← backup (переименуйте файл в это имя)
+migration/artifacts/            ← <Data Directory>/system/artifacts (необязательно: артефактов нет в ZIP)
+files/tls/inc.elara.local.cer   ← сертификат https
+files/tls/inc.elara.local.key   ← ключ
 ```
 
-и перенесите на ВМ (нужен `rsync` на control node: `sudo apt install rsync`):
+Например:
 
 ```bash
-ansible-playbook playbooks/40-teamcity-backup-upload.yml --limit $H
+mkdir -p migration
+scp root@<старый-сервер>:/data/teamcity-data/backup/<имя>.zip migration/TeamCity_Backup.zip
 ```
 
-Плейбук проверит свободное место, скопирует всё в `/srv/teamcity-migration` по rsync и сверит SHA-256 архива. Права выставляются сразу: `1000:1000` (пользователь TeamCity в контейнере), `0700`/`0600` (в ZIP есть пароли и токены). При обрыве просто запустите его ещё раз: он докачает только недостающее. На ВМ он ничего не удаляет.
+На control node нужен `rsync`: `sudo apt install rsync`.
 
-## 5. Подготовить TeamCity без запуска
+## 5. Перенос одной командой
 
 ```bash
-ansible-playbook playbooks/53-teamcity-proget.yml --limit $H --ask-vault-pass
+ansible-playbook playbooks/50-teamcity-migrate.yml --limit $H --ask-vault-pass
 ```
 
-В `hosts.yml` уже стоят `teamcity_start_containers: false` и `teamcity_migration_staging_dir: /srv/teamcity-migration`. `53` ставит Docker, скачивает образы и пишет `/opt/teamcity-2026/compose.yaml`, но **не запускает** TeamCity и PostgreSQL. Если запустить их раньше времени, создастся пустая база, и восстанавливать будет некуда. Если каталога `/srv/teamcity-migration` нет, `53` остановится.
+Что происходит:
 
-## 6. Артефакты и восстановление (на ВМ)
+1. Проверки: архив, сертификат и ключ на месте.
+2. Backup и артефакты копируются на ВМ в `/srv/teamcity-migration` (как `40`).
+3. Docker, образы из ProGet, `/opt/teamcity-2026/compose.yaml` (как `53`). TeamCity слушает только `127.0.0.1:8111`.
+4. **https**: nginx на 443 с сертификатом из `files/tls/`, `http` → `https`. Проверяется, что ключ подходит к сертификату, сертификат не просрочен и подходит к имени ВМ.
+5. **Восстановление** backup в PostgreSQL (`maintainDB restore`), артефакты, адрес сервера `https://<имя ВМ>`.
+6. **Первый запуск**: TeamCity принимает лицензионное соглашение (если `teamcity_accept_license_agreement: true`), обновляет данные 2018 → 2026 без ручного подтверждения и перезапускается в обычном режиме.
 
-Сначала артефакты, **до** первого запуска сервера:
+Итог: `https://deb-13-test-teamcity.inc.elara.local`, вход — пользователями старого сервера. Обновление данных **необратимо** для этой ВМ; старый сервер не затрагивается.
 
-```bash
-cd /opt/teamcity-2026
-docker compose create db server                    # создать тома, ничего не запуская
-IMG=$(docker compose config --images | grep teamcity-server)
-docker run --rm --network none --user 0:0 \
-  -v teamcity-2026_server_data:/target \
-  -v /srv/teamcity-migration/artifacts:/source:ro \
-  --entrypoint sh "$IMG" \
-  -ec 'mkdir -p /target/system/artifacts && cp -a /source/. /target/system/artifacts/ && chown -R 1000:1000 /target/system/artifacts'
-docker compose up -d db server
-```
+`teamcity_accept_license_agreement: true` в `hosts.yml` означает, что, запуская `50`, вы принимаете [TeamCity License Agreement](https://www.jetbrains.com/legal/docs/teamcity/license/). С `false` плейбук остановится на ожидании и напишет, как принять соглашение в браузере, затем продолжит сам.
 
-Откройте `http://<IP>:8111` → **Restore from backup**:
+Повторный запуск безопасен: восстановление (`/opt/teamcity-2026/.restored`) и первый запуск (`.upgraded`) выполняются один раз; если прошлый запуск оборвался — продолжит с места остановки. Тома Docker плейбук не удаляет. Если восстановление упало, журнал — `/opt/teamcity-2026/restore.log`, а плейбук подскажет, как начать заново.
 
-- файл `/migration/TeamCity_Backup.zip`;
-- база PostgreSQL: сервер `db:5432`, база и пользователь `teamcity`, пароль — `vault_teamcity_db_password` из `vault.yml`.
+## 6. После переноса
 
-Нового администратора **не создавайте**: пользователи придут из backup. После восстановления TeamCity предложит обновить формат данных 2018 → 2026. Это **необратимо**: старый 2018.1.3 на этих данных уже не запустится. Старый сервер со своими данными при этом остаётся нетронутым.
+Восстановленный сервер — копия рабочего: опрашивает VCS, отправляет письма и webhooks. На репетиции сразу отключите триггеры сборок и уведомления.
 
-Восстановленный сервер ведёт себя как настоящий: опрашивает VCS, отправляет письма и webhooks. На репетиции отключите сборки по триггерам и уведомления сразу после восстановления.
+- Проверьте проекты, пользователей, историю и артефакты.
+- **Агенты** (для CI/CD): в `<агент>/conf/buildAgent.properties` укажите `serverUrl=https://deb-13-test-teamcity.inc.elara.local`. Java агента должна доверять корпоративному УЦ. Затем **Agents → Unauthorized → Authorize** и пробная сборка.
 
-Проверьте проекты, пользователей, историю и артефакты, запустите пробную сборку на внешнем агенте (**Agents → Unauthorized** → авторизовать).
+**Финальный перенос** — из **нового** backup и в **чистые** тома: новая ВМ или `cd /opt/teamcity-2026 && docker compose down -v && rm -f .restored .upgraded` (удалит базу и данные этой ВМ — только осознанно), затем снова `50`. Потом переключите агентов и адрес на новый сервер. Откат — снова запустить старый сервер.
 
-**Финальный перенос** — из **нового** backup и в **чистые** тома. Данные репетиции для него не годятся: используйте новую ВМ или удалите тома репетиции (`docker compose down -v` удалит базу и данные — только осознанно). Затем переключите агентов и адрес на новый сервер. Откат — снова запустить старый сервер.
-
-**Чистая установка без переноса:** в `hosts.yml` поставьте `teamcity_start_containers: true` и удалите `teamcity_migration_staging_dir`, затем выполните `53`, откройте `http://<IP>:8111` и пройдите мастер настройки.
+**Чистая установка без переноса:** в `hosts.yml` поставьте `teamcity_start_containers: true` и удалите `teamcity_migration_staging_dir`, затем выполните только `53` и пройдите мастер настройки на `http://<IP>:8111` (для этого `teamcity_bind_address: 0.0.0.0`).
 
 ## Расширение диска (01)
 

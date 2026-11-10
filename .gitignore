@@ -12,3 +12,7 @@ collections/
 # Backup старого TeamCity — только локально.
 migration/*
 !migration/README.md
+
+# Сертификат и ключ https — только локально.
+files/tls/*
+!files/tls/README.md

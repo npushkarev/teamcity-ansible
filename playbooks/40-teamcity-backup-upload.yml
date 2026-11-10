@@ -138,4 +138,4 @@
         msg: |
           Backup на ВМ: {{ migration_dest_dir }}/{{ migration_backup_name }} (SHA-256 совпадает)
           В контейнере TeamCity: /migration/{{ migration_backup_name }}
-          Дальше: ansible-playbook playbooks/53-teamcity-proget.yml --limit {{ inventory_hostname }} --ask-vault-pass
+          Отдельный запуск 40 нужен редко: 50-teamcity-migrate делает перенос, установку и восстановление сразу.

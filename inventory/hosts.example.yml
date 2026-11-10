@@ -15,8 +15,8 @@ all:
         # ProGet работает по HTTPS, а 00 ставит сертификат УЦ — поэтому false.
         # Ошибка x509 на docker login (00 запускали без сертификата) — поставьте true.
         teamcity_registry_insecure: false
-        # http://<IP>:8111 в доверенной сети. 127.0.0.1 — только через nginx или SSH-туннель.
-        teamcity_bind_address: 0.0.0.0
+        # Наружу TeamCity виден только по https через nginx (50 ставит 127.0.0.1 сам).
+        teamcity_bind_address: 127.0.0.1
         # Сборки выполняет внешний агент; 1 — поднять локальный minimal agent.
         teamcity_local_agent_count: 0
         # ПЕРЕНОС со старого TeamCity: 53 готовит Docker, образы и Compose, но НЕ запускает
@@ -25,3 +25,7 @@ all:
         teamcity_start_containers: false
         # Каталог на ВМ с TeamCity_Backup.zip; внутри контейнера виден как /migration (только чтение).
         teamcity_migration_staging_dir: /srv/teamcity-migration
+        # 50: после восстановления TeamCity 2026 просит принять лицензионное соглашение.
+        # true — плейбук принимает его сам (https://www.jetbrains.com/legal/docs/teamcity/license/):
+        # запуская 50, вы принимаете TeamCity License Agreement. false — принять в браузере.
+        teamcity_accept_license_agreement: true
