@@ -239,11 +239,21 @@
 
         # apt update — только если списков нет (на свежей ВМ ProGet ещё не
         # подключён, update проходит по зеркалам Debian).
+        # Если списки apt устарели (в них версия, которой в зеркале уже нет -> 404),
+        # обновляем их и ставим ещё раз.
         - name: 5b-2. chrony
-          ansible.builtin.apt:
-            name: chrony
-            state: present
-            update_cache: "{{ 'Candidate:' not in _chrony_policy.stdout or 'Candidate: (none)' in _chrony_policy.stdout }}"
+          block:
+            - name: 5b-2a. chrony из имеющихся списков apt
+              ansible.builtin.apt:
+                name: chrony
+                state: present
+                update_cache: "{{ 'Candidate:' not in _chrony_policy.stdout or 'Candidate: (none)' in _chrony_policy.stdout }}"
+          rescue:
+            - name: 5b-2b. Списки apt устарели — apt update и повторная установка chrony
+              ansible.builtin.apt:
+                name: chrony
+                state: present
+                update_cache: true
 
         # Содержимое — ОДИН В ОДИН с baseline.yml (шаг 1c), иначе baseline
         # будет переписывать файл и перезапускать chrony.
