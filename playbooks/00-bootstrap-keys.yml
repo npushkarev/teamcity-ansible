@@ -1,0 +1,435 @@
+---
+# ===========================================================================
+# 00 — подготовка НОВОЙ Debian-ВМ: ключ, имя, прокси, пакеты, корневой
+#      сертификат и ProGet в источниках apt.
+#
+#   0) проверки на control node ДО любых изменений на ВМ: есть ли SSH-ключ,
+#      есть ли файл корневого сертификата (files/ca/ca.crt)
+#   1) порт 22 доступен
+#   2) hostname = имени машины в inventory (FQDN)
+#   3) прокси для apt (если задан в inventory/vault.yml): /etc/apt/apt.conf.d/00-platform-proxy
+#   4) python3 (без него ansible-модули не работают)
+#   5) строка 127.0.1.1 в /etc/hosts
+#   5b) время: chrony на внутренние NTP — ДО любого apt update (иначе apt
+#      отвергает подпись ProGet, если часы ВМ отстают)
+#   6) базовые пакеты + утилиты для расширения диска
+#   7) корневой сертификат (файлом) -> ProGet в источниках apt + GPG-ключ
+#      -> пакет ca-certificates-elara. Порядок — см. README, «Сертификаты»
+#   8) публичный ключ control node -> /root/.ssh/authorized_keys
+#   9) проверка входа по ключу (BatchMode, без пароля)
+#  10) отчёт
+#
+# Вход root по паролю НЕ закрывается — решение владельца (так удобнее).
+#
+# ДО ЗАПУСКА, на ВМ (консоль vCenter): узнать IP (ip a), убедиться, что root
+# пускает по SSH с паролем. IP вписать в inventory/hosts.yml.
+#
+# ЗАПУСК — от СВОЕГО пользователя, БЕЗ sudo (под sudo ключ ищется в /root):
+#   ansible-playbook playbooks/00-bootstrap-keys.yml --ask-pass --limit <fqdn>
+#   # прокси берётся из inventory/vault.yml (proxy_host, proxy_port, proxy_user, proxy_password)
+#   # без ProGet:          ... -e bootstrap_proget_enabled=false
+#   # без синхронизации времени (время выставлено руками): ... -e bootstrap_time_sync=false
+# ===========================================================================
+
+- name: Подготовка новой Debian-ВМ
+  hosts: all
+  gather_facts: false
+  vars:
+    # Прокси setup-фазы. Пусто = без прокси (тогда файлы прокси удаляются).
+    # Прокси из inventory/vault.yml: proxy_host, proxy_port, proxy_user, proxy_password.
+    # Логин и пароль — как есть: спецсимволы ($ @ : / \ # %) кодируются здесь сами.
+    # (Старый формат одной строкой platform_proxy_url тоже читается.)
+    proxy_url: "{{ ('http://' ~ (((proxy_user | urlencode | replace('/', '%2F')) ~ ':' ~ (proxy_password | default('') | urlencode | replace('/', '%2F')) ~ '@') if (proxy_user | default('')) | length > 0 else '') ~ proxy_host ~ ':' ~ (proxy_port | default(8080) | string)) if (proxy_host | default('')) | length > 0 else (platform_proxy_url | default('')) }}"
+    bootstrap_proxy_url: "{{ proxy_url }}"
+    bootstrap_no_proxy: "localhost,127.0.0.1,::1,.inc.elara.local,172.17.0.0/16"
+
+    # Корневой сертификат нашего УЦ — файлом с control node: пакет с ним лежит
+    # на самом ProGet, а в первый раз до ProGet без него не достучаться.
+    bootstrap_ca_file: "{{ playbook_dir }}/../files/ca/ca.crt"
+    # ProGet в источниках apt + пакет ca-certificates-elara. По умолчанию ВКЛЮЧЕНО:
+    # любая базовая машина рано или поздно берёт/кладёт данные в ProGet.
+    bootstrap_proget_enabled: true
+    bootstrap_proget_host: "proget.inc.elara.local"
+    bootstrap_proget_key_url: "https://{{ bootstrap_proget_host }}/debian/debian/keys/debian.gpg"
+    bootstrap_proget_repo_line: "deb [signed-by=/etc/apt/keyrings/debian.gpg] https://{{ bootstrap_proget_host }}/debian/debian/ stable main"
+    bootstrap_ca_package: "ca-certificates-elara"
+
+    # Время — ДО любого apt update (шаг 5b): при отстающих часах apt отвергает
+    # подпись ProGet. NTP и chrony.conf — те же, что в baseline.yml.
+    bootstrap_time_sync: true
+    ntp_servers: [172.17.0.2, 172.17.0.7]     # внутренние NTP (контроллеры домена)
+    bootstrap_time_wait_tries: 18             # x 10 с = ждать синхронизацию до 3 мин
+
+    # Приватный ключ control node — для проверки входа (шаг 9).
+    # SSH-ключ control node: публичный кладётся на машину в /root/.ssh/authorized_keys.
+    ssh_pubkey_path: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+    bootstrap_privkey_path: "{{ ssh_pubkey_path | regex_replace('\\.pub$', '') }}"
+    bootstrap_packages:
+      - open-vm-tools
+      - sudo
+      - curl
+      - wget
+      - gnupg
+      - ca-certificates
+      - rsync                # перенос дампов/архивов на этапе миграции данных
+      - cloud-guest-utils    # growpart — расширение раздела (01-expand-root)
+      - gdisk                # sgdisk -e — чинит GPT после расширения диска
+      - lvm2                 # если корень на LVM
+      - xfsprogs             # если корень на XFS
+  # Прокси живёт только в файле на машине (шаг 3): /etc/apt/apt.conf.d/00-platform-proxy.
+  # Тот же файл потом подтверждает роль proxy в baseline. Машина из интернета
+  # ничего не качает (всё — из files/ на control node), поэтому прокси нужен только apt.
+  tasks:
+    - name: "0-pre-a. Только с --limit <имя машины>"
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Запускай с --limit <имя машины>, чтобы не задеть другие машины."
+        quiet: true
+      run_once: true
+
+    - name: "0-pre-b. vault.yml — в inventory/, не в старом месте"
+      ansible.builtin.assert:
+        that: query('fileglob', inventory_dir ~ '/group_vars/all/vault.yml') | length == 0
+        fail_msg: "Переложи: mv {{ inventory_dir }}/group_vars/all/vault.yml {{ inventory_dir }}/vault.yml"
+        quiet: true
+      run_once: true
+      delegate_to: localhost
+      vars: { ansible_connection: local }
+
+    - name: "0-pre-c. Прочитать inventory/vault.yml (прокси)"
+      ansible.builtin.include_vars:
+        file: "{{ inventory_dir }}/vault.yml"
+      when: query('fileglob', inventory_dir ~ '/vault.yml') | length > 0
+
+    - name: "0-pre-d. Прокси"
+      ansible.builtin.debug:
+        msg: "{{ ('прокси: ЗАДАН — ' ~ (proxy_url | regex_replace('//[^@/]*@', '//***@'))) if proxy_url | length > 0 else 'прокси: НЕ задан' }}"
+      run_once: true
+
+    # --- 0. Проверки на control node — ДО любых изменений на ВМ -------------
+    - name: 0. Проверки на control node
+      run_once: true
+      delegate_to: localhost
+      vars: { ansible_connection: local }
+      block:
+        - name: 0a. Публичный SSH-ключ
+          ansible.builtin.stat:
+            path: "{{ ssh_pubkey_path }}"
+          register: _pub
+
+        - name: 0b. Приватный SSH-ключ
+          ansible.builtin.stat:
+            path: "{{ bootstrap_privkey_path }}"
+          register: _priv
+
+        - name: 0c. Ключ на месте?
+          ansible.builtin.assert:
+            that:
+              - _pub.stat.exists
+              - _priv.stat.exists
+            quiet: true
+            fail_msg: >-
+              Не найден SSH-ключ {{ ssh_pubkey_path }} (или его приватная пара).
+              {% if lookup('env', 'SUDO_USER') | length > 0 %}
+              Плейбук запущен через sudo (SUDO_USER={{ lookup('env', 'SUDO_USER') }}), поэтому
+              домашний каталог = {{ lookup('env', 'HOME') }}. Запусти БЕЗ sudo, от своего
+              пользователя. Если каталог репозитория принадлежит root, один раз:
+              sudo chown -R $USER: <каталог репозитория>.
+              {% else %}
+              Создай ключ: ssh-keygen -t ed25519 (Enter на все вопросы),
+              или укажи свой: -e ssh_pubkey_path=/путь/к/ключу.pub
+              {% endif %}
+
+        - name: 0d. Файл корневого сертификата
+          ansible.builtin.stat:
+            path: "{{ bootstrap_ca_file }}"
+          register: _ca
+          when: bootstrap_proget_enabled | bool
+
+        - name: 0e. Корневой сертификат на месте?
+          ansible.builtin.assert:
+            that: _ca.stat.exists
+            quiet: true
+            fail_msg: >-
+              Нет файла корневого сертификата {{ bootstrap_ca_file }}.
+              Положи туда корневой сертификат УЦ (тот же ca.crt, что в Dockerfile).
+              Без ProGet: -e bootstrap_proget_enabled=false
+          when: bootstrap_proget_enabled | bool
+
+    # --- 1. Связность -------------------------------------------------------
+    - name: 1. Порт 22 доступен с control node
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: 22
+        timeout: 10
+      delegate_to: localhost
+      vars: { ansible_connection: local }
+
+    # --- 2. Hostname (raw: python ещё может отсутствовать) ------------------
+    - name: 2a. Текущий hostname
+      ansible.builtin.raw: hostname
+      register: _cur_hostname
+      changed_when: false
+
+    - name: 2b. hostname = имени в inventory (FQDN)
+      ansible.builtin.raw: hostnamectl set-hostname {{ inventory_hostname }}
+      when: _cur_hostname.stdout | trim != inventory_hostname
+
+    # --- 3. Прокси setup-фазы ----------------------------------------------
+    - name: 3a. Прокси для apt -> /etc/apt/apt.conf.d/00-platform-proxy
+      # | quote — значение в одинарных кавычках: shell не трогает $ ` \ в пароле
+      # (раньше были двойные кавычки, и Pa$$w0rd превращался в Pa<PID>w0rd -> 407).
+      ansible.builtin.raw: >
+        printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n'
+        {{ bootstrap_proxy_url | quote }} {{ bootstrap_proxy_url | quote }}
+        > /etc/apt/apt.conf.d/00-platform-proxy
+      when: bootstrap_proxy_url | length > 0
+
+    - name: 3b. Прокси не задан -> убрать его из apt
+      ansible.builtin.raw: rm -f /etc/apt/apt.conf.d/00-platform-proxy
+      changed_when: false
+      when: bootstrap_proxy_url | length == 0
+
+    # --- 4. python3 (заодно проверка DNS -> прокси -> apt) -------------------
+    - name: 4a. python3 + python3-apt
+      ansible.builtin.raw: >
+        sh -c 'export DEBIAN_FRONTEND=noninteractive;
+        if ! command -v python3 >/dev/null 2>&1 || ! dpkg -s python3-apt >/dev/null 2>&1;
+        then apt-get update -qq && apt-get install -y -qq python3 python3-apt && echo INSTALLED; fi'
+      register: _py
+      changed_when: "'INSTALLED' in _py.stdout"
+
+    - name: 4b. Сбор фактов
+      ansible.builtin.setup:
+
+    - name: 4c. Поддерживаемая ОС?
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Debian'
+          - ansible_distribution_major_version in ['11', '12', '13']
+        fail_msg: "Только Debian 11/12/13. Обнаружено: {{ ansible_distribution }} {{ ansible_distribution_major_version }}"
+
+    # --- 5. /etc/hosts ------------------------------------------------------
+    - name: 5. 127.0.1.1 -> FQDN + короткое имя
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1\s'
+        line: "127.0.1.1 {{ inventory_hostname }} {{ inventory_hostname.split('.')[0] }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+    # --- 5b. Время — ДО любого apt update -----------------------------------
+    # ProGet подписывает списки пакетов, а apt в Debian 13 (sqv) отвергает
+    # подпись «из будущего», если часы ВМ отстают от ProGet:
+    #   "Signature ... was created after the --not-after date"
+    #   -> "The repository ... is not signed" (падал шаг 7f).
+    # Свежая ВМ из шаблона живёт со случайным временем, а chrony раньше
+    # настраивался только в baseline — последнем плейбуке.
+    # chrony ставится из УЖЕ имеющихся списков apt (update — только если их нет):
+    # при повторном прогоне ProGet уже в источниках, и update при неверных
+    # часах упал бы.
+    - name: 5b. Время по внутренним NTP (до любого apt update)
+      when: bootstrap_time_sync | bool
+      block:
+        - name: 5b-1. Есть ли chrony в имеющихся списках apt
+          ansible.builtin.command: apt-cache policy chrony
+          register: _chrony_policy
+          changed_when: false
+
+        # apt update — только если списков нет (на свежей ВМ ProGet ещё не
+        # подключён, update проходит по зеркалам Debian).
+        - name: 5b-2. chrony
+          ansible.builtin.apt:
+            name: chrony
+            state: present
+            update_cache: "{{ 'Candidate:' not in _chrony_policy.stdout or 'Candidate: (none)' in _chrony_policy.stdout }}"
+
+        # Содержимое — ОДИН В ОДИН с baseline.yml (шаг 1c), иначе baseline
+        # будет переписывать файл и перезапускать chrony.
+        - name: 5b-3. /etc/chrony/chrony.conf (как в baseline.yml, шаг 1c)
+          ansible.builtin.copy:
+            dest: /etc/chrony/chrony.conf
+            mode: '0644'
+            content: |
+              # Managed by ansible (baseline). Только внутренние NTP: внешние недоступны за прокси.
+              {% for s in ntp_servers %}
+              server {{ s }} iburst
+              {% endfor %}
+              driftfile /var/lib/chrony/chrony.drift
+              makestep 1.0 3
+              rtcsync
+              logdir /var/log/chrony
+          register: _chrony_conf
+
+        - name: 5b-4. chrony запущен (перезапуск — если конфиг изменился)
+          ansible.builtin.systemd:
+            name: chrony
+            enabled: true
+            state: "{{ 'restarted' if _chrony_conf is changed else 'started' }}"
+
+        # makestep 1.0 3 в конфиге: на первых обновлениях chrony ШАГОМ ставит
+        # верное время при любом расхождении. waitsync ждёт синхронизации
+        # (остаточная поправка < 1 с), попытка раз в 10 с.
+        - name: 5b-5. Дождаться синхронизации часов
+          ansible.builtin.command: "chronyc waitsync {{ bootstrap_time_wait_tries }} 1"
+          register: _waitsync
+          changed_when: false
+          failed_when: false
+
+        - name: 5b-6. Часы синхронизированы?
+          ansible.builtin.assert:
+            that: _waitsync.rc == 0
+            fail_msg: >-
+              Часы НЕ синхронизировались с NTP {{ ntp_servers | join(', ') }}
+              ({{ bootstrap_time_wait_tries }} попыток раз в 10 с). Проверь на ВМ: chronyc sources -v
+              (доступен ли UDP 123 до этих серверов). Без верного времени apt отвергнет
+              подпись ProGet ("created after the --not-after date"). Обход: выставить
+              время руками и запустить с -e bootstrap_time_sync=false.
+            success_msg: "время: синхронизировано с {{ ntp_servers | join(', ') }}"
+
+    # --- 6. Пакеты ----------------------------------------------------------
+    # Остатки прежних версий этого плейбука (неверный адрес фида + временное
+    # отключение проверки TLS) — убрать, иначе apt update падает.
+    - name: 6-pre. Убрать старые настройки ProGet
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/proget.sources
+        - /etc/apt/apt.conf.d/99-proget-bootstrap-tls
+
+    - name: 6a. Базовые пакеты + утилиты диска
+      ansible.builtin.apt:
+        name: "{{ bootstrap_packages }}"
+        state: present
+        update_cache: true
+
+    - name: 6b. open-vm-tools запущен и включён
+      ansible.builtin.systemd:
+        name: open-vm-tools
+        state: started
+        enabled: true
+
+    # --- 7. Корневой сертификат -> ProGet -> ca-certificates-elara ------------
+    - name: 7. Корневой сертификат и ProGet
+      when: bootstrap_proget_enabled | bool
+      block:
+        # /usr/local/share/ca-certificates — каталог, который update-ca-certificates
+        # подхватывает сам. (/usr/share/ca-certificates из Dockerfile срабатывает,
+        # только если пакет ca-certificates ставится ПОСЛЕ копирования файла;
+        # на ВМ он уже стоит.)
+        - name: 7a. Корневой сертификат -> /usr/local/share/ca-certificates/elara-ca.crt
+          ansible.builtin.copy:
+            src: "{{ bootstrap_ca_file }}"
+            dest: /usr/local/share/ca-certificates/elara-ca.crt
+            owner: root
+            group: root
+            mode: '0644'
+          register: _ca_file
+
+        - name: 7b. Обновить хранилище доверенных сертификатов
+          ansible.builtin.command: update-ca-certificates
+          when: _ca_file is changed
+
+        - name: 7c. Каталог /etc/apt/keyrings
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
+        # Качаем во временный файл: wget -O при ошибке оставляет пустой файл,
+        # и потом apt падал бы с NO_PUBKEY. Подменяем ключ, только если он новый.
+        - name: 7d. GPG-ключ ProGet -> /etc/apt/keyrings/debian.gpg
+          ansible.builtin.shell: |
+            set -e
+            tmp=$(mktemp)
+            wget -qO "$tmp" {{ bootstrap_proget_key_url }}
+            test -s "$tmp"
+            if cmp -s "$tmp" /etc/apt/keyrings/debian.gpg; then echo same
+            else install -m 0644 "$tmp" /etc/apt/keyrings/debian.gpg; echo updated; fi
+            rm -f "$tmp"
+          register: _proget_key
+          changed_when: "'updated' in _proget_key.stdout"
+
+        - name: 7e. ProGet в источниках apt
+          ansible.builtin.copy:
+            dest: /etc/apt/sources.list.d/proget-debian.list
+            content: "{{ bootstrap_proget_repo_line }}\n"
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: 7f. apt update + {{ bootstrap_ca_package }}
+          ansible.builtin.apt:
+            name: "{{ bootstrap_ca_package }}"
+            state: present
+            update_cache: true
+
+    # --- 8. SSH-ключ control node -------------------------------------------
+    - name: 8a. /root/.ssh (0700)
+      ansible.builtin.file:
+        path: /root/.ssh
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: 8b. Публичный ключ control node -> root
+      ansible.posix.authorized_key:
+        user: root
+        state: present
+        key: "{{ lookup('file', ssh_pubkey_path) }}"
+
+    # --- 9. Проверка входа по ключу ------------------------------------------
+    # Ключ нужен всем следующим плейбукам (01, 53). Падение здесь не
+    # останавливает плей: сначала отчёт (шаг 10), явная ошибка — в самом конце.
+    - name: 9. Вход по ключу с control node (пароль в проверке запрещён)
+      ansible.builtin.command: >-
+        ssh -i {{ bootstrap_privkey_path }}
+        -o BatchMode=yes -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10
+        root@{{ ansible_host | default(inventory_hostname) }} true
+      delegate_to: localhost
+      vars: { ansible_connection: local }
+      register: _key_test
+      changed_when: false
+      ignore_errors: true
+
+    # --- 10. Отчёт -----------------------------------------------------------
+    - name: 10a. Разметка дисков
+      ansible.builtin.command: lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+      register: _lsblk
+      changed_when: false
+
+    - name: 10b. Заполнение корня
+      ansible.builtin.command: df -h /
+      register: _df
+      changed_when: false
+
+    - name: 10c. Итог
+      ansible.builtin.debug:
+        msg: |
+          ============== {{ inventory_hostname }} ==============
+          hostname : {{ ansible_fqdn | default(inventory_hostname) }}
+          ос       : Debian {{ ansible_distribution_major_version }}
+          прокси   : {{ bootstrap_proxy_url | default('(не задан)', true) | regex_replace('//[^@/]*@', '//***@') }}
+          CA+ProGet: {{ ('корневой сертификат + ProGet + ' ~ bootstrap_ca_package) if (bootstrap_proget_enabled | bool) else 'пропущено (bootstrap_proget_enabled=false)' }}
+          ключ ssh : {{ 'работает' if _key_test.rc == 0 else 'НЕ РАБОТАЕТ' }}
+          -- диски:
+          {{ _lsblk.stdout }}
+          {{ _df.stdout }}
+          -- дальше:
+            snapshot ВМ, затем (если диск увеличен в vSphere):
+            ansible-playbook playbooks/01-expand-root.yml --limit {{ inventory_hostname }} -e expand_root_confirm=yes
+            ansible-playbook playbooks/53-teamcity-proget.yml --limit {{ inventory_hostname }} --ask-vault-pass
+
+    - name: "10d. СТОП: вход по ключу не работает"
+      ansible.builtin.fail:
+        msg: >-
+          Вход по ключу НЕ работает (rc={{ _key_test.rc }}). Следующие плейбуки
+          ходят по ключу. Проверь: ключ {{ ssh_pubkey_path }} — этого control node?
+          authorized_keys записан (шаг 8)? sshd на ВМ жив?
+      when: _key_test.rc != 0

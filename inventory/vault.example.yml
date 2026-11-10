@@ -1,0 +1,20 @@
+---
+# Один файл секретов для 00 и 53. Скопируйте, заполните, зашифруйте:
+#   cp inventory/vault.example.yml inventory/vault.yml
+#   ansible-vault encrypt inventory/vault.yml
+# inventory/vault.yml в git не попадает.
+
+# Прокси для apt (00). Нужен — раскомментируйте. Логин и пароль — как есть,
+# спецсимволы ($ @ : / \ # %) плейбук закодирует сам.
+# proxy_host: "172.17.0.153"
+# proxy_port: 8080
+# proxy_user: "USER"
+# proxy_password: "PASSWORD"
+
+# Пароль PostgreSQL TeamCity (53): openssl rand -hex 24.
+# Минимум 16 символов: A-Z/a-z/0-9/_/-. После первого запуска не менять.
+vault_teamcity_db_password: "CHANGE_ME_POSTGRES_PASSWORD"
+
+# Учётка ProGet для docker login (53): пользователь и пароль или API-ключ.
+vault_proget_registry_user: "CHANGE_ME_PROGET_USER"
+vault_proget_registry_password: "CHANGE_ME_PROGET_PASSWORD"

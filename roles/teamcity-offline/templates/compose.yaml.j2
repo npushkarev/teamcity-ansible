@@ -1,0 +1,80 @@
+name: teamcity-2026
+services:
+{% if teamcity_node_kind == 'server' %}
+  db:
+    image: {{ teamcity_db_deploy_image }}
+    platform: linux/{{ teamcity_bundle_arch }}
+    pull_policy: {{ 'never' if teamcity_image_source == 'offline' else 'if_not_present' }}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: teamcity
+      POSTGRES_USER: teamcity
+      POSTGRES_PASSWORD: ${TC_DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: --encoding=UTF8
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U teamcity -d teamcity']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+  server:
+    image: {{ teamcity_server_deploy_image }}
+    platform: linux/{{ teamcity_bundle_arch }}
+    pull_policy: {{ 'never' if teamcity_image_source == 'offline' else 'if_not_present' }}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TEAMCITY_DB_URL: jdbc:postgresql://db:5432/teamcity
+      TEAMCITY_DB_USER: teamcity
+      TEAMCITY_DB_PASSWORD: ${TC_DB_PASSWORD}
+    ports:
+      - '{{ teamcity_bind_address }}:{{ teamcity_port }}:8111'
+    volumes:
+      - server_data:/data/teamcity_server/datadir
+      - server_logs:/opt/teamcity/logs
+      - ./jdbc:/data/teamcity_server/datadir/lib/jdbc:ro
+{% if teamcity_migration_staging_dir | length > 0 %}
+      - '{{ teamcity_migration_staging_dir }}:/migration:ro'
+{% endif %}
+{% for n in range(1, teamcity_local_agent_count | int + 1) %}
+  agent{{ n }}:
+    image: {{ teamcity_agent_deploy_image }}
+    platform: linux/{{ teamcity_bundle_arch }}
+    pull_policy: {{ 'never' if teamcity_image_source == 'offline' else 'if_not_present' }}
+    restart: unless-stopped
+    depends_on:
+      - server
+    environment:
+      SERVER_URL: http://server:8111
+      AGENT_NAME: {{ inventory_hostname }}-local-{{ n }}
+    volumes:
+      - agent{{ n }}_conf:/data/teamcity_agent/conf
+{% endfor %}
+volumes:
+  db_data:
+  server_data:
+  server_logs:
+{% for n in range(1, teamcity_local_agent_count | int + 1) %}
+  agent{{ n }}_conf:
+{% endfor %}
+{% else %}
+{% for n in range(1, teamcity_remote_agent_count | int + 1) %}
+  agent{{ n }}:
+    image: {{ teamcity_agent_deploy_image }}
+    platform: linux/{{ teamcity_bundle_arch }}
+    pull_policy: {{ 'never' if teamcity_image_source == 'offline' else 'if_not_present' }}
+    restart: unless-stopped
+    environment:
+      SERVER_URL: {{ teamcity_server_url }}
+      AGENT_NAME: {{ inventory_hostname }}-{{ n }}
+    volumes:
+      - agent{{ n }}_conf:/data/teamcity_agent/conf
+{% endfor %}
+volumes:
+{% for n in range(1, teamcity_remote_agent_count | int + 1) %}
+  agent{{ n }}_conf:
+{% endfor %}
+{% endif %}

@@ -1,0 +1,340 @@
+---
+# ===========================================================================
+# 01 — Растянуть корень ( / ) на весь системный диск. Запускать ПОСЛЕ 00.
+#
+# ПРОБЛЕМА (типовая разметка debian-installer на клоне):
+#   sda      200G                 <- диск задан в vSphere
+#   ├─sda1  ~28G ext4  /          <- корень (данные тут)
+#   ├─sda2    1K       extended   <- MBR extended-контейнер
+#   └─sda5  ~1.6G swap            <- swap ВНУТРИ extended, сразу за корнем
+#   [ ~170G свободно в конце диска ]
+# Между корнем и свободным местом стоит swap -> growpart корень не растянет.
+#
+# РЕШЕНИЕ: убрать swap-раздел с дороги и растянуть корень
+#   на весь диск, а swap вернуть ФАЙЛОМ (/swapfile) — файл лежит внутри корня
+#   и разметке не мешает.
+#   swapoff -> удалить sda5 (swap) и sda2 (extended) -> growpart sda1 ->
+#   (удаляются ТОЛЬКО swap/extended ПОСЛЕ корня; EFI и прочее ДО корня не трогаются)
+#   resize2fs / -> создать /swapfile -> swapon -> fstab.
+#
+# ⚠️ ДЕСТРУКТИВНО (меняет таблицу разделов живого корня). Перед запуском
+#    ОБЯЗАТЕЛЬНО свежий snapshot ВМ в vSphere — это точка отката.
+#    Плейбук проверяет флаг подтверждения, чтобы не запуститься случайно.
+#
+# ИДЕМПОТЕНТНОСТЬ: если корень уже занимает почти весь диск — плейбук видит
+#    это и завершается no-op (ничего не трогает). Повторный прогон безопасен.
+#
+# ЗАПУСК (после снапшота, всегда с --limit одной ВМ):
+#   ansible-playbook playbooks/01-expand-root.yml --limit <fqdn> -e expand_root_confirm=yes
+#
+# Если ядро не перечитает таблицу разделов на живом корне, плейбук по умолчанию
+# перезагрузит ВМ и до-растянет ФС сам. Отключить авто-reboot: -e expand_root_reboot=false
+# ===========================================================================
+
+- name: Растянуть корень на весь системный диск
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    expand_root_confirm: "no"          # защита: запуск только с -e expand_root_confirm=yes
+    expand_root_reboot: true           # авто-reboot, если ядро держит старую таблицу
+    swapfile_path: /swapfile
+    swapfile_size_mb: 2048             # размер swap-файла (замена swap-раздела)
+    # Порог: если корень уже занимает >= этой доли диска — считаем, что растягивать нечего.
+    expand_root_already_pct: 90
+
+  tasks:
+    # --- 0. Guard'ы ---------------------------------------------------------
+    - name: 0a. Требуется явное подтверждение (был ли сделан snapshot?)
+      ansible.builtin.assert:
+        that: expand_root_confirm | string | lower in ['yes', 'true', '1']
+        fail_msg: >-
+          НЕ подтверждено. Сначала сделай snapshot ВМ в vSphere (точка отката),
+          затем запусти с флагом: -e expand_root_confirm=yes
+        success_msg: "Подтверждено. Предполагается, что snapshot ВМ уже сделан."
+
+    - name: 0b. Только Debian
+      ansible.builtin.assert:
+        that: ansible_distribution == 'Debian'
+        fail_msg: "Плейбук рассчитан только на Debian."
+
+    # --- 0c. Инструменты работы с разделами (плейбук самодостаточен) ---------
+    # parted — модулю community.general.parted (удаление swap/extended) + partprobe;
+    # cloud-guest-utils — growpart (растяжка КОРНЯ на живой системе);
+    # e2fsprogs — resize2fs; util-linux — blockdev/swapon/findmnt/lsblk.
+    # Не полагаемся на то, что их поставил 00, — ставим здесь явно.
+    - name: 0c. Установить parted, growpart и утилиты работы с ФС/разделами
+      ansible.builtin.apt:
+        name:
+          - parted            # community.general.parted + partprobe
+          - cloud-guest-utils # growpart — растянуть смонтированный корень
+          - e2fsprogs         # resize2fs (ext4)
+          - util-linux        # blockdev, swapon, findmnt, lsblk
+          - gdisk             # на случай GPT (sgdisk)
+        state: present
+        update_cache: true
+
+    # --- 1. Определить устройство корня и диск ------------------------------
+    - name: 1a. Источник корня ( / )
+      ansible.builtin.command: findmnt -no SOURCE /
+      register: _root_src
+      changed_when: false
+
+    - name: 1b. ФС корня
+      ansible.builtin.command: findmnt -no FSTYPE /
+      register: _root_fstype
+      changed_when: false
+
+    - name: "1c. Guard: корень должен быть ext4 (этот плейбук под ext4)"
+      ansible.builtin.assert:
+        that: _root_fstype.stdout | trim == 'ext4'
+        fail_msg: >-
+          Корень не ext4 (обнаружено: {{ _root_fstype.stdout | trim }}).
+          Плейбук рассчитан на ext4. Останови и проверь разметку.
+
+    - name: "1d. Guard: корень не на LVM (этот плейбук — под голый раздел)"
+      ansible.builtin.assert:
+        that: not (_root_src.stdout is search('/dev/mapper/') or _root_src.stdout is search('/dev/.*vg'))
+        fail_msg: >-
+          Корень выглядит как LVM ({{ _root_src.stdout }}). Этот плейбук —
+          для голого раздела (sdaN). Для LVM логика другая, останови и скажи мне.
+
+    - name: 1e. Имя раздела корня и диск-родитель
+      ansible.builtin.set_fact:
+        root_part: "{{ _root_src.stdout | trim }}"                      # /dev/sda1
+        root_partnum: "{{ _root_src.stdout | trim | regex_replace('^.*[^0-9]([0-9]+)$', '\\1') }}"
+
+    - name: 1f. Диск-родитель корня (pkname)
+      ansible.builtin.command: "lsblk -no pkname {{ root_part }}"
+      register: _pkname
+      changed_when: false
+
+    - name: 1g. Зафиксировать путь диска
+      ansible.builtin.set_fact:
+        root_disk: "/dev/{{ _pkname.stdout_lines | first | trim }}"    # /dev/sda
+
+    # --- 2. Проверка идемпотентности: не растянут ли корень уже? -------------
+    - name: 2a. Размер диска и раздела корня (байты)
+      ansible.builtin.shell: |
+        set -eu
+        echo "disk=$(blockdev --getsize64 {{ root_disk }})"
+        echo "part=$(blockdev --getsize64 {{ root_part }})"
+      register: _sizes
+      changed_when: false
+
+    - name: 2b. Вычислить долю раздела от диска
+      ansible.builtin.set_fact:
+        _disk_bytes: "{{ _sizes.stdout_lines[0].split('=')[1] | int }}"
+        _part_bytes: "{{ _sizes.stdout_lines[1].split('=')[1] | int }}"
+
+    - name: 2c. Уже растянут? (раздел занимает почти весь диск)
+      ansible.builtin.set_fact:
+        _already_expanded: "{{ (_part_bytes | int) * 100 / (_disk_bytes | int) >= (expand_root_already_pct | int) }}"
+
+    - name: 2d. Если уже растянут — сообщить и выйти (no-op)
+      when: _already_expanded | bool
+      block:
+        - name: Показать статус
+          ansible.builtin.command: df -h /
+          register: _df_noop
+          changed_when: false
+        - name: Ничего делать не нужно
+          ansible.builtin.debug:
+            msg: |
+              Корень {{ root_part }} уже занимает
+              {{ ((_part_bytes | int) * 100 / (_disk_bytes | int)) | round(1) }}% диска {{ root_disk }}.
+              Растягивать нечего.
+              {{ _df_noop.stdout }}
+        - name: Завершить play для этого хоста
+          ansible.builtin.meta: end_host
+
+    # --- 3. Показать план и текущую разметку --------------------------------
+    - name: 3. Текущая разметка (до изменений)
+      ansible.builtin.command: "lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS {{ root_disk }}"
+      register: _lsblk_before
+      changed_when: false
+
+    - name: 3b. План
+      ansible.builtin.debug:
+        msg: |
+          Диск   : {{ root_disk }} ({{ (_disk_bytes | int / 1024 / 1024 / 1024) | round(1) }} GiB)
+          Корень : {{ root_part }} ({{ (_part_bytes | int / 1024 / 1024 / 1024) | round(1) }} GiB) -> растянем на весь диск
+          Swap   : разделы после корня будут удалены, swap заменён файлом {{ swapfile_path }} ({{ swapfile_size_mb }} MiB)
+          {{ _lsblk_before.stdout }}
+
+    # --- 3c. Защита: удаляем ТОЛЬКО swap/extended ПОСЛЕ корня ---------------
+    # Разделы ПЕРЕД корнем (EFI /boot/efi, BIOS boot) не трогаем: без них ВМ не
+    # загрузится. Если после корня есть раздел с данными (/home, /var, LVM) или
+    # смонтированный раздел — стоп до любых изменений.
+    - name: 3c. Прочитать таблицу разделов
+      community.general.parted:
+        device: "{{ root_disk }}"
+        unit: MiB
+      register: _pt
+      changed_when: false
+
+    - name: 3d. Смонтированные устройства
+      ansible.builtin.command: findmnt -rno SOURCE
+      register: _mounted
+      changed_when: false
+
+    - name: 3e. Разделы после корня
+      ansible.builtin.set_fact:
+        _after_root: >-
+          {{ _pt.partitions
+             | selectattr('begin', 'gt', (_pt.partitions | selectattr('num', 'equalto', root_partnum | int) | first).begin)
+             | list }}
+
+    - name: "3f. Guard: после корня только swap/extended, ничего не смонтировано"
+      ansible.builtin.assert:
+        that:
+          - item.fstype in ['', 'linux-swap(v1)', 'linux-swap(new)', 'linux-swap']
+          - item.flags | intersect(['lvm', 'raid', 'esp', 'bios_grub', 'boot']) | length == 0
+          - (root_part | regex_replace('[0-9]+$', item.num | string)) not in _mounted.stdout_lines
+        fail_msg: >-
+          Раздел {{ item.num }} после корня не похож на swap/extended
+          (fstype={{ item.fstype | default('', true) }}, flags={{ item.flags }}).
+          Плейбук рассчитан на разметку «корень, затем swap». Ничего не изменено.
+        quiet: true
+      loop: "{{ _after_root }}"
+      loop_control:
+        label: "раздел {{ item.num }}"
+
+    # --- 4. Отключить swap-раздел и убрать его из fstab ---------------------
+    - name: 4a. Отключить весь swap
+      ansible.builtin.command: swapoff -a
+      changed_when: true
+
+    - name: 4b. Убрать swap-РАЗДЕЛ из fstab (строки со swap, кроме будущего swapfile)
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^(?!.*{{ swapfile_path }}).*\bswap\b.*$'
+        replace: '# \g<0>   # swap-раздел удалён 01-expand-root, заменён swapfile'
+
+    # --- 5. Удалить swap+extended и растянуть корень ------------------------
+    # У типовой разметки: sda1 корень, sda2 extended, sda5 swap (логический
+    # внутри extended). Сначала parted удаляет НЕ смонтированные разделы (swap,
+    # extended) — это работает. А вот растянуть КОРЕНЬ через parted нельзя:
+    # parted отказывается менять смонтированный раздел ("is being used").
+    # Поэтому границу корня двигаем growpart'ом — он для того и создан
+    # (расширение раздела под живой системой), сам уведомляет ядро.
+    - name: 5b. Удалить разделы ПОСЛЕ корня (swap, extended, логические)
+      community.general.parted:
+        device: "{{ root_disk }}"
+        number: "{{ item }}"
+        state: absent
+      loop: "{{ _after_root | map(attribute='num') | list | sort(reverse=True) }}"
+      loop_control:
+        label: "раздел {{ item }}"
+
+    # growpart двигает границу корневого раздела на весь свободный хвост.
+    # Работает на смонтированном корне. rc: 0 = расширено, 1 = NOCHANGE
+    # (уже на максимум) — оба успех; иначе реальная ошибка.
+    - name: 5c. Растянуть корневой раздел до конца диска (growpart)
+      ansible.builtin.command: "growpart {{ root_disk }} {{ root_partnum }}"
+      register: _growpart
+      changed_when: "'NOCHANGE' not in _growpart.stdout"
+      failed_when:
+        - _growpart.rc != 0
+        - _growpart.rc != 1
+
+    - name: 5d. Перечитать таблицу разделов ядром
+      ansible.builtin.command: "partprobe {{ root_disk }}"
+      register: _partprobe
+      changed_when: true
+      failed_when: false
+
+    # --- 6. Проверить, увидело ли ядро новый размер раздела -----------------
+    - name: 6a. Новый размер раздела корня по мнению ядра
+      ansible.builtin.command: "blockdev --getsize64 {{ root_part }}"
+      register: _part_now
+      changed_when: false
+
+    - name: 6b. Ядро уже видит увеличенный раздел?
+      ansible.builtin.set_fact:
+        _kernel_sees_new: "{{ (_part_now.stdout | int) * 100 / (_disk_bytes | int) >= (expand_root_already_pct | int) }}"
+
+    # --- 7. Если ядро держит старую таблицу — reboot ------------------------
+    - name: 7. Reboot, чтобы ядро перечитало таблицу разделов
+      when: not (_kernel_sees_new | bool)
+      block:
+        - name: 7a. Требуется reboot — сообщить
+          ansible.builtin.debug:
+            msg: >-
+              Ядро держит старую таблицу разделов (раздел под смонтированным /).
+              {{ 'Перезагружаю ВМ и продолжу.' if expand_root_reboot | bool
+                 else 'Авто-reboot отключён — перезагрузи ВМ вручную и запусти плейбук повторно.' }}
+
+        - name: 7b. Перезагрузка (если разрешена)
+          ansible.builtin.reboot:
+            reboot_timeout: 600
+          when: expand_root_reboot | bool
+
+        - name: 7c. Стоп, если reboot запрещён
+          ansible.builtin.fail:
+            msg: "Нужен reboot для перечитывания таблицы. Перезагрузи ВМ и запусти 01-expand-root повторно."
+          when: not (expand_root_reboot | bool)
+
+    # --- 8. Растянуть файловую систему на новый размер раздела --------------
+    - name: 8. resize2fs — растянуть ext4 корня
+      ansible.builtin.command: "resize2fs {{ root_part }}"
+      register: _resize
+      changed_when: "'Nothing to do' not in _resize.stderr and 'Nothing to do' not in _resize.stdout"
+
+    # --- 9. Вернуть swap файлом --------------------------------------------
+    - name: 9a. Создать swap-файл (если ещё нет)
+      ansible.builtin.command: "fallocate -l {{ swapfile_size_mb }}M {{ swapfile_path }}"
+      args:
+        creates: "{{ swapfile_path }}"
+
+    - name: 9b. Права 600 на swap-файл
+      ansible.builtin.file:
+        path: "{{ swapfile_path }}"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: 9c. Инициализировать как swap (если не инициализирован)
+      ansible.builtin.command: "mkswap {{ swapfile_path }}"
+      register: _mkswap
+      changed_when: "'Setting up swapspace' in _mkswap.stdout"
+      failed_when:
+        - _mkswap.rc != 0
+        - "'already contains a swap' not in _mkswap.stderr"
+
+    - name: 9d. Включить swap-файл
+      ansible.builtin.command: "swapon {{ swapfile_path }}"
+      register: _swapon
+      changed_when: true
+      failed_when:
+        - _swapon.rc != 0
+        - "'already active' not in _swapon.stderr"
+
+    - name: 9e. Прописать swap-файл в fstab
+      ansible.posix.mount:
+        path: none
+        src: "{{ swapfile_path }}"
+        fstype: swap
+        opts: sw
+        state: present
+
+    # --- 10. Отчёт ----------------------------------------------------------
+    - name: 10a. Итоговая разметка
+      ansible.builtin.command: "lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS {{ root_disk }}"
+      register: _lsblk_after
+      changed_when: false
+
+    - name: 10b. Заполнение корня и swap
+      ansible.builtin.shell: "df -h / ; echo '---' ; swapon --show ; free -h"
+      register: _final
+      changed_when: false
+
+    - name: 10c. Сводка
+      ansible.builtin.debug:
+        msg: |
+          ============== EXPAND-ROOT {{ inventory_hostname }} ==============
+          корень {{ root_part }} растянут на весь диск {{ root_disk }}
+          swap перенесён в файл {{ swapfile_path }} ({{ swapfile_size_mb }} MiB)
+          {{ _lsblk_after.stdout }}
+          {{ _final.stdout }}
+          -- следующий шаг: ansible-playbook playbooks/53-teamcity-proget.yml --limit {{ inventory_hostname }} --ask-vault-pass

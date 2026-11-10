@@ -1,0 +1,40 @@
+TeamCity {{ teamcity_version }} — как пользоваться этим каталогом
+====================================================
+
+Рабочий стек (образы, compose, пароль БД):
+  {{ teamcity_deploy_dir }}
+
+Эта копия в домашнем каталоге — для удобства: compose и эта справка.
+Пароль базы здесь нет. Он только в {{ teamcity_deploy_dir }}/.env (права 0600, root).
+
+Открыть
+  http://<адрес-ВМ>:{{ teamcity_port }}/
+  Привязка порта: {{ teamcity_bind_address }}:{{ teamcity_port }}
+
+Первый запуск
+  1. Подтвердите первый старт.
+  2. Примите лицензионное соглашение.
+  3. Пройдите мастер: база уже PostgreSQL, администратора создайте в мастере.
+  4. Agents → Unauthorized — авторизуйте агентов.
+
+Лицензия
+  Образ сервера уже с патчем (безлимит агентов, конфигураций и pipelines),
+  если teamcity_apply_license_patch=true.
+  Страница лицензий скрыта в меню. Прямая ссылка:
+  http://<адрес-ВМ>:{{ teamcity_port }}/admin/admin.html?item=license
+
+Управление (на ВМ, от root)
+  cd {{ teamcity_deploy_dir }}
+  docker compose ps
+  docker compose logs --tail=100 server
+  docker compose stop
+  docker compose start
+  docker compose up -d --pull never --no-build
+
+Не запускайте
+  docker compose down -v
+  Это удалит тома PostgreSQL, Data Directory и логи.
+
+Данные
+  Docker volumes проекта teamcity-2026: db_data, server_data, server_logs
+  и отдельные тома конфигурации агентов.

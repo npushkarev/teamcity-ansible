@@ -1,0 +1,53 @@
+---
+# Добавляет только нужный registry в существующий daemon.json, остальные ключи сохраняет.
+- name: Ensure Docker configuration directory exists
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Check Docker daemon configuration
+  ansible.builtin.stat:
+    path: /etc/docker/daemon.json
+  register: teamcity_docker_daemon_stat
+
+- name: Read existing Docker daemon configuration
+  ansible.builtin.slurp:
+    src: /etc/docker/daemon.json
+  register: teamcity_docker_daemon_slurp
+  when: teamcity_docker_daemon_stat.stat.exists
+
+- name: Parse existing Docker daemon configuration
+  ansible.builtin.set_fact:
+    teamcity_docker_daemon_existing: >-
+      {{ ((teamcity_docker_daemon_slurp.content | default('') | b64decode)
+          | default('{}', true) | from_json) }}
+
+- name: Read the current list of insecure registries
+  ansible.builtin.set_fact:
+    teamcity_docker_insecure_existing: "{{ teamcity_docker_daemon_existing['insecure-registries'] | default([]) }}"
+
+# union() не сохраняет порядок: файл менялся бы при каждом запуске и Docker перезапускался.
+# Поэтому только дописываем адрес в конец и не трогаем файл, если он уже есть.
+- name: Allow the internal HTTP Docker registry
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: '0644'
+    content: >-
+      {{ teamcity_docker_daemon_existing | combine({
+        'insecure-registries': teamcity_docker_insecure_existing + [teamcity_registry_host]
+      }) | to_nice_json }}
+  when: teamcity_registry_host not in teamcity_docker_insecure_existing
+  register: teamcity_docker_daemon_config
+  notify: Restart Docker for TeamCity registry settings
+
+- name: Apply Docker registry configuration before pulling images
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify Docker after registry configuration
+  ansible.builtin.command: docker info --format '{{ "{{" }}.ServerVersion{{ "}}" }}'
+  changed_when: false

@@ -1,0 +1,57 @@
+---
+teamcity_version: '2026.2'
+teamcity_server_image: 'jetbrains/teamcity-server:2026.2'
+# Derivative server image shipped in files/teamcity-offline/<arch>/patch
+# (license-limit patch). Must match the tag inside patched-server-image.tar.
+# Empty string or teamcity_apply_license_patch: false
+# falls back to the stock image.
+teamcity_server_patched_image: 'teamcity-server-2026.2-unlimited:amd64'
+teamcity_apply_license_patch: true
+teamcity_agent_image: 'jetbrains/teamcity-minimal-agent:2026.2'
+teamcity_db_image: 'postgres:16-alpine'
+teamcity_node_kind: server
+teamcity_bundle_arch: amd64
+teamcity_bundle_dir: "{{ playbook_dir }}/../files/teamcity-offline/{{ teamcity_bundle_arch }}"
+
+# Источник образов: offline — прежние tar-архивы; registry — Docker Registry/ProGet.
+teamcity_image_source: offline
+teamcity_registry: proget.inc.elara.local/main/library
+teamcity_registry_server_image: "{{ teamcity_registry }}/teamcity-server:{{ teamcity_version }}-unlimited"
+teamcity_registry_agent_image: "{{ teamcity_registry }}/teamcity-minimal-agent:{{ teamcity_version }}"
+teamcity_registry_db_image: "{{ teamcity_registry }}/postgres:16-alpine"
+teamcity_registry_user: "{{ vault_proget_registry_user | default('') }}"
+teamcity_registry_password: "{{ vault_proget_registry_password | default('') }}"
+teamcity_registry_host: "{{ teamcity_registry_server_image.split('/')[0] }}"
+# Для HTTP-реестра в доверенной закрытой сети. Для HTTPS с доверенным CA — false.
+teamcity_registry_insecure: false
+
+# Docker daemon для playbooks/53-teamcity-proget.yml (как в 30-common-bootstrap).
+# Остальные ключи существующего daemon.json сохраняются.
+# DNS контейнеров задаётся явно: если ВМ загрузилась до выдачи DNS по DHCP, Docker
+# подставит 8.8.8.8 и TeamCity не увидит внутренние хосты (Bitbucket и т. п.).
+# Пустой список — DNS по умолчанию Docker.
+teamcity_docker_dns: [172.17.0.2, 172.17.0.7]
+teamcity_docker_dns_search: [inc.elara.local]
+teamcity_docker_nofile: 65536
+teamcity_docker_log_max_size: 50m
+teamcity_docker_log_max_file: '3'
+
+# Эффективные ссылки используются одним Compose-шаблоном в обоих режимах.
+teamcity_server_deploy_image: >-
+  {{ teamcity_registry_server_image if teamcity_image_source == 'registry' else
+     (teamcity_server_patched_image if teamcity_apply_license_patch | bool else teamcity_server_image) }}
+teamcity_agent_deploy_image: "{{ teamcity_registry_agent_image if teamcity_image_source == 'registry' else teamcity_agent_image }}"
+teamcity_db_deploy_image: "{{ teamcity_registry_db_image if teamcity_image_source == 'registry' else teamcity_db_image }}"
+
+teamcity_deploy_dir: /opt/teamcity-2026
+teamcity_bind_address: 127.0.0.1
+teamcity_port: 8111
+teamcity_local_agent_count: 1
+teamcity_remote_agent_count: 1
+teamcity_server_url: ''
+# Set false while preparing an empty target for restore from a legacy server.
+# The DB and TeamCity server must not be initialized before the restore plan.
+teamcity_start_containers: true
+# Optional absolute directory on the target VM with a legacy maintainDB ZIP.
+# Mounted read-only at /migration inside the server for first-start restore.
+teamcity_migration_staging_dir: ''

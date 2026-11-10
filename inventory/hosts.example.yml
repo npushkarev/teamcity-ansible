@@ -1,0 +1,21 @@
+---
+# Скопируйте в inventory/hosts.yml (в git не попадает).
+# Имя хоста = будущий FQDN машины: 00 сам поставит его hostname'ом.
+all:
+  vars:
+    ansible_user: root
+  children:
+    teamcity:
+      hosts:
+        deb-13-test-teamcity.inc.elara.local:
+          ansible_host: 192.0.2.10            # IP из `ip a` в консоли ВМ
+      vars:
+        teamcity_bundle_arch: amd64
+        teamcity_registry: proget.inc.elara.local/main/library
+        # ProGet работает по HTTPS, а 00 ставит сертификат УЦ — поэтому false.
+        # Ошибка x509 на docker login (00 запускали без сертификата) — поставьте true.
+        teamcity_registry_insecure: false
+        # http://<IP>:8111 в доверенной сети. 127.0.0.1 — только через nginx или SSH-туннель.
+        teamcity_bind_address: 0.0.0.0
+        # Сборки выполняет внешний агент; 1 — поднять локальный minimal agent.
+        teamcity_local_agent_count: 0

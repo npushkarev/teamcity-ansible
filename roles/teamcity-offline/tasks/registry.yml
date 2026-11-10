@@ -1,0 +1,60 @@
+---
+- name: Pull TeamCity images from the registry
+  when: teamcity_image_source == 'registry'
+  block:
+    - name: Log in to the Docker registry
+      ansible.builtin.command:
+        argv:
+          - docker
+          - login
+          - "{{ teamcity_registry_host }}"
+          - --username
+          - "{{ teamcity_registry_user }}"
+          - --password-stdin
+        stdin: "{{ teamcity_registry_password }}"
+        stdin_add_newline: true
+      changed_when: false
+      no_log: true
+
+    - name: Pull TeamCity images with Docker Compose
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ teamcity_deploy_dir }}/compose.yaml"
+          - pull
+        chdir: "{{ teamcity_deploy_dir }}"
+      register: teamcity_registry_pull
+      changed_when: >-
+        'Downloaded newer image' in (teamcity_registry_pull.stderr ~ teamcity_registry_pull.stdout)
+        or 'Pull complete' in (teamcity_registry_pull.stderr ~ teamcity_registry_pull.stdout)
+
+    - name: Start TeamCity containers from registry images
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ teamcity_deploy_dir }}/compose.yaml"
+          - up
+          - --no-build
+          - -d
+        chdir: "{{ teamcity_deploy_dir }}"
+      register: teamcity_compose_up
+      changed_when: >-
+        'Started' in (teamcity_compose_up.stderr ~ teamcity_compose_up.stdout)
+        or 'Created' in (teamcity_compose_up.stderr ~ teamcity_compose_up.stdout)
+        or 'Recreated' in (teamcity_compose_up.stderr ~ teamcity_compose_up.stdout)
+      no_log: true
+      when: teamcity_start_containers | bool
+  always:
+    - name: Log out from the Docker registry
+      ansible.builtin.command:
+        argv:
+          - docker
+          - logout
+          - "{{ teamcity_registry_host }}"
+      changed_when: false
+      failed_when: false
+      no_log: true

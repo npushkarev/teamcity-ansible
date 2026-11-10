@@ -1,0 +1,6 @@
+---
+# Коллекции для 00 (authorized_key) и 01 (parted, mount). 53 обходится без них.
+#   ansible-galaxy collection install -r requirements.yml -p ./collections
+collections:
+  - name: ansible.posix
+  - name: community.general

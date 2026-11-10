@@ -1,0 +1,10 @@
+# Секреты и реальные inventory не публикуются.
+inventory/hosts.yml
+inventory/vault.yml
+inventory/group_vars/*/vault.yml
+inventory/host_vars/
+.vault_pass*
+*.retry
+.fact_cache/
+collections/
+.DS_Store

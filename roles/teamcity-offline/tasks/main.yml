@@ -1,0 +1,261 @@
+---
+- name: Validate node, image source and bundle settings
+  ansible.builtin.assert:
+    that:
+      - teamcity_node_kind in ['server', 'agent']
+      - teamcity_image_source in ['offline', 'registry']
+      - teamcity_bundle_arch in ['amd64', 'arm64']
+      - (ansible_architecture == 'x86_64' and teamcity_bundle_arch == 'amd64') or (ansible_architecture == 'aarch64' and teamcity_bundle_arch == 'arm64')
+      - teamcity_node_kind != 'agent' or teamcity_server_url | length > 0
+      - teamcity_node_kind != 'server' or vault_teamcity_db_password is defined
+      - teamcity_node_kind != 'server' or vault_teamcity_db_password | default('') | length >= 16
+      - teamcity_node_kind != 'server' or vault_teamcity_db_password | default('') is match('^[A-Za-z0-9_-]+$')
+      - teamcity_image_source != 'registry' or teamcity_registry_user | length > 0
+      - teamcity_image_source != 'registry' or teamcity_registry_password | length > 0
+      - teamcity_local_agent_count | int >= 0
+      - teamcity_remote_agent_count | int >= 1
+    fail_msg: Check target architecture, image source, registry credentials, TeamCity URL, agent count and vaulted database password.
+
+- name: Check Docker Engine
+  ansible.builtin.command: docker info --format '{{ "{{" }}.ServerVersion{{ "}}" }}'
+  register: teamcity_docker_version
+  changed_when: false
+
+- name: Check Docker Compose v2
+  ansible.builtin.command: docker compose version --short
+  changed_when: false
+
+- name: Configure access to an internal HTTP registry
+  ansible.builtin.import_tasks: registry-daemon.yml
+  when:
+    - teamcity_image_source == 'registry'
+    - teamcity_registry_insecure | bool
+
+- name: Check migration staging directory on the target
+  ansible.builtin.stat:
+    path: "{{ teamcity_migration_staging_dir }}"
+  register: teamcity_migration_staging
+  when:
+    - teamcity_node_kind == 'server'
+    - teamcity_migration_staging_dir | length > 0
+
+- name: Require staged migration directory
+  ansible.builtin.assert:
+    that:
+      - teamcity_migration_staging.stat.isdir | default(false)
+    fail_msg: "Migration staging directory is missing: {{ teamcity_migration_staging_dir }}"
+  when:
+    - teamcity_node_kind == 'server'
+    - teamcity_migration_staging_dir | length > 0
+
+- name: Check bundle image archive on control node
+  ansible.builtin.stat:
+    path: "{{ teamcity_bundle_dir }}/{{ 'server-images.tar' if teamcity_node_kind == 'server' else 'agent-images.tar' }}"
+  delegate_to: localhost
+  become: false
+  register: teamcity_image_archive
+  when: teamcity_image_source == 'offline'
+
+- name: Require complete image archive
+  ansible.builtin.assert:
+    that: teamcity_image_archive.stat.exists
+    fail_msg: "Missing offline image archive under {{ teamcity_bundle_dir }}"
+  when: teamcity_image_source == 'offline'
+
+- name: Check PostgreSQL JDBC driver on control node
+  ansible.builtin.stat:
+    path: "{{ teamcity_bundle_dir }}/jdbc/postgresql-42.7.13.jar"
+  delegate_to: localhost
+  become: false
+  register: teamcity_jdbc_file
+  when: teamcity_node_kind == 'server'
+
+- name: Require JDBC driver for PostgreSQL
+  ansible.builtin.assert:
+    that: teamcity_jdbc_file.stat.exists
+    fail_msg: PostgreSQL JDBC driver missing from the repository bundle.
+  when: teamcity_node_kind == 'server'
+
+- name: Create deployment directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  loop:
+    - "{{ teamcity_deploy_dir }}"
+    - "{{ teamcity_deploy_dir }}/jdbc"
+
+- name: Transfer Docker image archive
+  ansible.builtin.copy:
+    src: "{{ teamcity_bundle_dir }}/{{ 'server-images.tar' if teamcity_node_kind == 'server' else 'agent-images.tar' }}"
+    dest: "{{ teamcity_deploy_dir }}/images.tar"
+    owner: root
+    group: root
+    mode: '0644'
+  register: teamcity_image_copy
+  when: teamcity_image_source == 'offline'
+
+- name: Transfer JDBC driver
+  ansible.builtin.copy:
+    src: "{{ teamcity_bundle_dir }}/jdbc/postgresql-42.7.13.jar"
+    dest: "{{ teamcity_deploy_dir }}/jdbc/postgresql-42.7.13.jar"
+    owner: root
+    group: root
+    mode: '0644'
+  when: teamcity_node_kind == 'server'
+
+- name: Check required images before loading archive
+  ansible.builtin.command:
+    argv: [docker, image, inspect, "{{ item }}"]
+  loop: "{{ [teamcity_agent_image] + ([teamcity_server_image, teamcity_db_image] if teamcity_node_kind == 'server' else []) }}"
+  register: teamcity_images_before
+  changed_when: false
+  failed_when: false
+  when: teamcity_image_source == 'offline'
+
+- name: Load images from offline archive
+  ansible.builtin.command:
+    argv:
+      - docker
+      - load
+      - -i
+      - "{{ teamcity_deploy_dir }}/images.tar"
+  when:
+    - teamcity_image_source == 'offline'
+    - teamcity_image_copy.changed or (teamcity_images_before.results | selectattr('rc', 'ne', 0) | list | length > 0)
+
+- name: Verify required images exist locally
+  ansible.builtin.command:
+    argv: [docker, image, inspect, "{{ item }}"]
+  loop: "{{ [teamcity_agent_image] + ([teamcity_server_image, teamcity_db_image] if teamcity_node_kind == 'server' else []) }}"
+  changed_when: false
+  no_log: true
+  when: teamcity_image_source == 'offline'
+
+- name: Transfer server license patch bundle
+  ansible.builtin.copy:
+    src: "{{ teamcity_bundle_dir }}/patch/"
+    dest: "{{ teamcity_deploy_dir }}/patch"
+    owner: root
+    group: root
+    mode: '0644'
+  register: teamcity_patch_copy
+  when:
+    - teamcity_image_source == 'offline'
+    - teamcity_node_kind == 'server'
+    - teamcity_apply_license_patch | bool
+
+- name: Load patched TeamCity server image from archive
+  ansible.builtin.command:
+    argv: [docker, load, -i, "{{ teamcity_deploy_dir }}/patch/patched-server-image.tar"]
+  register: teamcity_patch_load
+  when:
+    - teamcity_image_source == 'offline'
+    - teamcity_node_kind == 'server'
+    - teamcity_apply_license_patch | bool
+
+- name: Verify patched server image exists
+  ansible.builtin.command:
+    argv: [docker, image, inspect, "{{ teamcity_server_patched_image }}"]
+  changed_when: false
+  no_log: true
+  when:
+    - teamcity_image_source == 'offline'
+    - teamcity_node_kind == 'server'
+    - teamcity_apply_license_patch | bool
+
+- name: Render Docker Compose stack
+  ansible.builtin.template:
+    src: compose.yaml.j2
+    dest: "{{ teamcity_deploy_dir }}/compose.yaml"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Render database secret environment
+  ansible.builtin.template:
+    src: server.env.j2
+    dest: "{{ teamcity_deploy_dir }}/.env"
+    owner: root
+    group: root
+    mode: '0600'
+  no_log: true
+  when: teamcity_node_kind == 'server'
+
+- name: Write operator help next to the Compose file
+  ansible.builtin.template:
+    src: HELP.txt.j2
+    dest: "{{ teamcity_deploy_dir }}/HELP.txt"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Create a home copy of the Compose stack
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME | default('/root') }}/teamcity-2026"
+    state: directory
+    owner: "{{ ansible_user_uid | default(omit) }}"
+    group: "{{ ansible_user_gid | default(omit) }}"
+    mode: '0755'
+
+- name: Copy Compose file and help into the login home directory
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ ansible_env.HOME | default('/root') }}/teamcity-2026/{{ item.dest }}"
+    remote_src: true
+    owner: "{{ ansible_user_uid | default(omit) }}"
+    group: "{{ ansible_user_gid | default(omit) }}"
+    mode: '0644'
+  loop:
+    - { src: "{{ teamcity_deploy_dir }}/compose.yaml", dest: compose.yaml }
+    - { src: "{{ teamcity_deploy_dir }}/HELP.txt", dest: HELP.txt }
+
+- name: Validate Compose file without contacting a registry
+  ansible.builtin.command:
+    argv: [docker, compose, -f, "{{ teamcity_deploy_dir }}/compose.yaml", config, -q]
+    chdir: "{{ teamcity_deploy_dir }}"
+  changed_when: false
+  no_log: true
+
+- name: Pull and start TeamCity with registry images
+  ansible.builtin.import_tasks: registry.yml
+  when: teamcity_image_source == 'registry'
+
+- name: Start TeamCity containers from loaded images only
+  ansible.builtin.command:
+    argv: [docker, compose, -f, "{{ teamcity_deploy_dir }}/compose.yaml", up, --pull, never, --no-build, -d]
+    chdir: "{{ teamcity_deploy_dir }}"
+  register: teamcity_compose_up
+  changed_when: "'Started' in teamcity_compose_up.stdout or 'Created' in teamcity_compose_up.stdout"
+  no_log: true
+  when:
+    - teamcity_image_source == 'offline'
+    - teamcity_start_containers | bool
+
+# The first-start and maintenance pages answer 503 ("TeamCity Maintenance"): that already means
+# the server is up and waiting in the browser. A 503 counts only when it comes from TeamCity.
+- name: Wait for TeamCity HTTP setup page
+  ansible.builtin.uri:
+    url: "http://{{ '127.0.0.1' if teamcity_bind_address == '0.0.0.0' else teamcity_bind_address }}:{{ teamcity_port }}/"
+    follow_redirects: none
+    status_code: [200, 301, 302, 303, 503]
+    return_content: true
+    timeout: 10
+  register: teamcity_http
+  until: >-
+    teamcity_http is succeeded and
+    (teamcity_http.status != 503 or teamcity_http.teamcity_node_id is defined
+     or 'TeamCity' in (teamcity_http.content | default('')))
+  retries: 90
+  delay: 10
+  when:
+    - teamcity_node_kind == 'server'
+    - teamcity_start_containers | bool
+
+- name: Show local deployment status
+  ansible.builtin.command:
+    argv: [docker, compose, -f, "{{ teamcity_deploy_dir }}/compose.yaml", ps]
+    chdir: "{{ teamcity_deploy_dir }}"
+  changed_when: false

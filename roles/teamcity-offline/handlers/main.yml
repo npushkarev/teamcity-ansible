@@ -1,0 +1,6 @@
+---
+- name: Restart Docker for TeamCity registry settings
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+    enabled: true
