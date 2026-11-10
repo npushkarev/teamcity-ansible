@@ -13,8 +13,24 @@
           - --password-stdin
         stdin: "{{ teamcity_registry_password }}"
         stdin_add_newline: true
+      register: teamcity_registry_login
       changed_when: false
+      failed_when: false
       no_log: true
+
+    # Пароль идёт через stdin и в ответ Docker не попадает — текст ошибки показываем.
+    - name: Docker registry login succeeded
+      ansible.builtin.assert:
+        that: teamcity_registry_login.rc == 0
+        fail_msg: |
+          docker login {{ teamcity_registry_host }} (пользователь {{ teamcity_registry_user }}) не прошёл:
+          {{ (teamcity_registry_login.stderr | default('')) | regex_replace(teamcity_registry_password | regex_escape, '***') if teamcity_registry_password | length > 0 else teamcity_registry_login.stderr | default('') }}
+          - unauthorized / 401: проверьте vault_proget_registry_user и vault_proget_registry_password
+            (ansible-vault edit inventory/vault.yml); для API-ключа ProGet логин — api, пароль — ключ;
+          - x509 / certificate signed by unknown authority: на ВМ нет корпоративного УЦ (00 запускали без
+            files/ca/ca.crt) — либо поставьте УЦ, либо teamcity_registry_insecure: true в hosts.yml;
+          - timeout / no such host: ВМ не видит {{ teamcity_registry_host }} (DNS, сеть).
+        quiet: true
 
     - name: Pull TeamCity images with Docker Compose
       ansible.builtin.command:
