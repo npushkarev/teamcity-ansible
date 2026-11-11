@@ -1,0 +1,667 @@
+---
+# ===========================================================================
+# 62 — Перенос Windows-агентов TeamCity на новый сервер (https). Все агенты сразу — 60.
+#
+# Доступ: WinRM (группа teamcity_agents_windows, см. inventory/hosts.example.yml).
+# На control node: apt install ansible python3-winrm (ansible.windows — из пакета ansible).
+#
+# Для каждого агента (C:\BuildAgent2026, служба TCBuildAgent2026):
+#   - нового агента нет — teamcity-agent-windows-migrate.ps1 ставит его РЯДОМ со старым
+#     (-KeepOldService: старый работает, пока новый не зарегистрировался на сервере);
+#   - новый агент уже стоит, но смотрит на другой сервер (тестовый 172.17.6.61) —
+#     перенаправление: сертификаты в conf\trustedCertificates, serverUrl в buildAgent.properties
+#     (Latin-1, старый токен удаляется); агент сам перезапускается после текущей сборки;
+#   - затем (кроме -e teamcity_agents_keep_old=true) старый агент выключается
+#     teamcity-agent-windows-disable-old.ps1 — только когда новый уже зарегистрировался;
+#   - авторизация нового агента и пул старого (REST на control node).
+# Корпоративный УЦ ставится в LocalMachine\Root (проверка https скриптом) и в
+# conf\trustedCertificates агента (Java агента). Скрипты копируются байт в байт.
+# Сам перенос — по одному агенту; сбой или недоступность одного не останавливает остальных:
+# причина — в итоге, хост помечается упавшим в самом конце. Старый агент выключается, только
+# когда новый доказанно зарегистрирован (журнал агента и, при токене, REST: подключён).
+#
+# Запуск:
+#   ansible-playbook playbooks/62-teamcity-agents-windows.yml --limit ba-w22-01.inc.elara.local \
+#     --ask-vault-pass -e agents_confirm=yes
+# ===========================================================================
+
+- name: Prepare agent distribution on control node
+  hosts: teamcity_agents_windows
+  gather_facts: false
+  vars:
+    agent_files: "{{ playbook_dir }}/../files/teamcity-agent"
+    agent_build: "{{ agent_files }}/build"
+    ca_file: "{{ playbook_dir }}/../files/ca/ca.crt"
+    tls_src_dir: "{{ playbook_dir }}/../files/tls"
+    agent_required_files:
+      - "{{ agent_files }}/windows/teamcity-agent-windows-migrate.ps1"
+      - "{{ agent_files }}/windows/teamcity-agent-windows-disable-old.ps1"
+      - "{{ agent_files }}/windows/teamcity-agent-windows-remove-new.ps1"
+      - "{{ agent_files }}/windows/teamcity-agent-windows-ansible.ps1"
+    agent_payload_files: >-
+      {{ agent_required_files + query('fileglob', agent_files ~ '/jdk/amazon-corretto-21*-windows-x64-jdk.zip') }}
+  tasks:
+    - name: Prepare
+      ansible.builtin.import_tasks: tasks/agent-prepare.yml
+
+    # Скрипт проверяет в архиве только bin\agent.bat и conf\buildAgent.dist.properties;
+    # без остального он падает уже посреди установки.
+    - name: Agent zip has everything the Windows script and the agent need
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - -c
+          - |
+            import sys, zipfile
+            need = ['bin/agent.bat', 'bin/service.install.bat', 'conf/buildAgent.dist.properties',
+                    'launcher/conf/wrapper.conf', 'conf/trustedCertificates/elara-ca.pem']
+            names = set(zipfile.ZipFile(sys.argv[1]).namelist())
+            miss = [n for n in need if n not in names]
+            print('missing: ' + ', '.join(miss) if miss else 'ok')
+            sys.exit(1 if miss else 0)
+          - "{{ agent_build }}/buildAgentFull-https.zip"
+      changed_when: false
+      delegate_to: localhost
+      run_once: true
+
+    # В GitLab это файл Git LFS: указатель (134 байта) пройдёт -Check и сломает установку.
+    - name: Corretto zip on control node is the real file
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop: "{{ query('fileglob', agent_files ~ '/jdk/amazon-corretto-21*-windows-x64-jdk.zip') }}"
+      register: corretto_stat
+      delegate_to: localhost
+      run_once: true
+
+    - name: Corretto zip is not a Git LFS pointer
+      ansible.builtin.assert:
+        that: corretto_stat.results | selectattr('stat.size', 'lt', 1000000) | list | length == 0
+        fail_msg: >-
+          {{ corretto_stat.results | selectattr('stat.size', 'lt', 1000000) | map(attribute='item') | list }} —
+          это указатель Git LFS, а не архив. Скачайте файл из GitLab кнопкой Download и сверьте SHA256SUMS.
+        quiet: true
+      run_once: true
+
+- name: Migrate Windows agents to the new server
+  hosts: teamcity_agents_windows
+  gather_facts: false
+  # Без serial: сбой одного агента не останавливает остальных. Сам перенос — по одному (throttle).
+  # Ошибка хоста попадает в итог (rescue), хост падает в самом конце — после авторизации остальных.
+  vars:
+    agent_files: "{{ playbook_dir }}/../files/teamcity-agent"
+    agent_build: "{{ agent_files }}/build"
+    work_dir: 'C:\ProgramData\teamcity-agent-migrate'
+    new_dir: 'C:\BuildAgent2026'
+    new_service: TCBuildAgent2026
+    server_url: "{{ hostvars['localhost'].agents_server_url }}"
+    old_dir_hint: "{{ teamcity_agent_old_dir | default('', true) }}"
+    agent_wait: "{{ teamcity_agents_wait | default(600) | int }}"
+    keep_old: "{{ teamcity_agents_keep_old | default(false) | bool }}"
+    autostart_checked: "{{ teamcity_agent_old_autostart_checked | default(false) | bool }}"
+    src_sums: "{{ hostvars[ansible_play_hosts_all[0]].agent_src_sums.results | default([]) }}"
+    server_pem: >-
+      {{ src_sums | map(attribute='stat') | selectattr('exists') | map(attribute='path')
+         | select('search', '/trusted/teamcity-server[.]pem$') | list | first | default('') }}
+    corretto_zip: >-
+      {{ src_sums | map(attribute='stat') | selectattr('exists') | map(attribute='path')
+         | select('search', '/amazon-corretto-21[^/]*-windows-x64-jdk[.]zip$') | list | first | default('') }}
+    ps_file: [powershell.exe, -NoProfile, -NonInteractive, -ExecutionPolicy, Bypass, -File]
+    # Пути с обратным слэшем — только текстом шаблона: внутри строк Jinja '\t', '\b' стали бы
+    # табуляцией и backspace.
+    helper: "{{ work_dir }}\\teamcity-agent-windows-ansible.ps1"
+    wd_migrate: "{{ work_dir }}\\teamcity-agent-windows-migrate.ps1"
+    wd_disable: "{{ work_dir }}\\teamcity-agent-windows-disable-old.ps1"
+    wd_remove: "{{ work_dir }}\\teamcity-agent-windows-remove-new.ps1"
+    wd_zip: "{{ work_dir }}\\buildAgentFull-https.zip"
+    wd_jdk: "{{ work_dir }}\\{{ corretto_zip | basename }}"
+    wd_oldjson: "{{ work_dir }}\\old-service.json"
+    old_dir_arg: "{{ ['-OldDir', agent_state.old_dir] if (agent_state.old_dir | default('') | length > 0) else [] }}"
+    tcjson: "{{ '^TCJSON ' }}"
+    rest_token: "{{ vault_teamcity_admin_token | default('') }}"
+  tasks:
+    - name: Агент обрабатывается в этом запуске
+      ansible.builtin.set_fact:
+        agent_attempted: true
+        agent_rc: -1
+        agent_new_ready: false
+
+    - name: Read inventory/vault.yml when present
+      ansible.builtin.include_vars:
+        file: "{{ inventory_dir }}/vault.yml"
+      when: query('fileglob', inventory_dir ~ '/vault.yml') | length > 0
+      no_log: true
+
+    - name: "Перенос агента {{ inventory_hostname }}"
+      block:
+        # --- 1. Доступ и файлы (параллельно, старого агента не трогает) -------------
+        # Недоступный хост — в итог, а не «unreachable»: иначе, когда недоступны все,
+        # Ansible пропустил бы и следующие play (Linux/Windows, авторизацию).
+        - name: "1a. WinRM"
+          ansible.windows.win_ping:
+          register: agent_ping
+          ignore_unreachable: true
+
+        - name: "1a. WinRM доступен"
+          ansible.builtin.fail:
+            msg: "{{ inventory_hostname }}: НЕДОСТУПЕН по WinRM — {{ agent_ping.msg | default('') }}"
+          when: agent_ping.unreachable | default(false) | bool
+
+        # Только администраторы и SYSTEM (по SID — имена групп на русской Windows другие):
+        # здесь скрипты, которые запускаются от администратора. Каталог создаётся сразу с этими
+        # правами; уже существующий, созданный не администратором, — отказ.
+        - name: "1b. Рабочий каталог {{ work_dir }}: только Administrators и SYSTEM"
+          ansible.windows.win_shell: |
+            $ErrorActionPreference = 'Stop'
+            $p = '{{ work_dir }}'
+            $ba = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+            $sy = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-18'
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $okSids = @($ba.Value, $sy.Value, $me.Value)
+            $sidType = [System.Security.Principal.SecurityIdentifier]
+            function New-WorkDirSecurity {
+              $sec = New-Object System.Security.AccessControl.DirectorySecurity
+              $sec.SetAccessRuleProtection($true, $false)
+              foreach ($sid in @($ba, $sy)) {
+                $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+                $sec.AddAccessRule($rule)
+              }
+              return $sec
+            }
+            $changed = $false
+            if (-not (Test-Path -LiteralPath $p)) {
+              [void][System.IO.Directory]::CreateDirectory($p, (New-WorkDirSecurity))
+              $changed = $true
+            }
+            $bad = @()
+            $items = New-Object System.Collections.Generic.List[object]
+            $items.Add((Get-Item -LiteralPath $p -Force))
+            $queue = New-Object System.Collections.Generic.Queue[string]
+            $queue.Enqueue($p)
+            while ($queue.Count -gt 0) {
+              foreach ($it in @(Get-ChildItem -LiteralPath $queue.Dequeue() -Force)) {
+                $items.Add($it)
+                if ($it.Attributes -band [IO.FileAttributes]::ReparsePoint) { $bad += "$($it.FullName): reparse point" }
+                elseif ($it.PSIsContainer) { $queue.Enqueue($it.FullName) }
+              }
+            }
+            foreach ($it in $items) {
+              $acl = Get-Acl -LiteralPath $it.FullName
+              $owner = $acl.GetOwner($sidType).Value
+              if ($okSids -notcontains $owner) { $bad += "$($it.FullName): owner $owner" }
+              foreach ($r in $acl.GetAccessRules($true, $false, $sidType)) {
+                if ($r.AccessControlType -eq 'Allow' -and $okSids -notcontains $r.IdentityReference.Value) {
+                  $bad += "$($it.FullName): access for $($r.IdentityReference.Value)"
+                }
+              }
+            }
+            if ($bad.Count -gt 0) { Write-Output ('UNSAFE ' + ($bad -join '; ')); exit 2 }
+            $acl = Get-Acl -LiteralPath $p
+            $have = @($acl.GetAccessRules($true, $true, $sidType) | ForEach-Object {
+                '{0}|{1}|{2}|{3}|{4}' -f $_.IdentityReference.Value, [int]$_.FileSystemRights, [int]$_.InheritanceFlags, [int]$_.PropagationFlags, $_.AccessControlType
+              } | Sort-Object)
+            $want = @("$($ba.Value)|2032127|3|0|Allow", "$($sy.Value)|2032127|3|0|Allow") | Sort-Object
+            if (-not $acl.AreAccessRulesProtected -or (($have -join ',') -ne ($want -join ','))) {
+              Set-Acl -LiteralPath $p -AclObject (New-WorkDirSecurity)
+              $changed = $true
+            }
+            if ($changed) { 'CHANGED' } else { 'OK' }
+          register: agent_workdir
+          changed_when: "'CHANGED' in agent_workdir.stdout"
+          failed_when: agent_workdir.rc != 0
+          # Сообщение UNSAFE — в выводе задачи: удалите каталог вручную (от администратора) и запустите снова.
+
+        # Байт в байт (src:), не шаблоном: скриптам нужен UTF-8 BOM.
+        - name: "1c. Скрипты и сертификаты"
+          ansible.windows.win_copy:
+            src: "{{ item.src }}"
+            dest: "{{ work_dir }}\\{{ item.dest }}"
+          loop: >-
+            {{ [{'src': agent_files ~ '/windows/teamcity-agent-windows-migrate.ps1', 'dest': 'teamcity-agent-windows-migrate.ps1'},
+                {'src': agent_files ~ '/windows/teamcity-agent-windows-disable-old.ps1', 'dest': 'teamcity-agent-windows-disable-old.ps1'},
+                {'src': agent_files ~ '/windows/teamcity-agent-windows-remove-new.ps1', 'dest': 'teamcity-agent-windows-remove-new.ps1'},
+                {'src': agent_files ~ '/windows/teamcity-agent-windows-ansible.ps1', 'dest': 'teamcity-agent-windows-ansible.ps1'},
+                {'src': hostvars['localhost'].agents_ca_file, 'dest': 'elara-ca.pem'}]
+               + ([{'src': server_pem, 'dest': 'teamcity-server.pem'}] if server_pem | length > 0 else []) }}
+          loop_control:
+            label: "{{ item.dest }}"
+
+        # Проверка https в скрипте идёт через хранилище Windows (Java агента — через trustedCertificates).
+        - name: "1d. Корпоративный УЦ в LocalMachine\\Root"
+          ansible.windows.win_certificate_store:
+            path: "{{ work_dir }}\\elara-ca.pem"
+            store_name: Root
+            store_location: LocalMachine
+            state: present
+
+        # --- 2. Что на машине ----------------------------------------------------------
+        - name: "2a. Состояние: PowerShell, старый и новый агент"
+          ansible.windows.win_command:
+            argv: "{{ ps_file + [helper, '-Action', 'State', '-Dir', new_dir, '-NewService', new_service, '-ServerUrl', server_url]
+                      + (['-OldDir', old_dir_hint] if old_dir_hint | length > 0 else []) }}"
+          register: agent_state_raw
+          changed_when: false
+
+        - name: "2b. Разбор"
+          ansible.builtin.set_fact:
+            agent_state: "{{ (agent_state_raw.stdout_lines | select('match', tcjson) | first)[7:] | from_json }}"
+
+        - name: "2c. Режим"
+          ansible.builtin.set_fact:
+            agent_mode: "{{ agent_state.mode }}"
+            agent_needs_password: >-
+              {{ agent_state.mode == 'migrate' and not (agent_state.old_system_account | bool) }}
+
+        - name: "2d. Машина подходит"
+          ansible.builtin.assert:
+            that:
+              - (agent_state.ps.split('.')[0] | int) >= 5
+              - (agent_state.exec_policy.MachinePolicy | default('Undefined')) in ['Undefined', 'Bypass', 'Unrestricted', 'RemoteSigned']
+              - (agent_state.exec_policy.UserPolicy | default('Undefined')) in ['Undefined', 'Bypass', 'Unrestricted', 'RemoteSigned']
+              - agent_state.language_mode == 'FullLanguage'
+              - agent_mode != 'broken'
+            fail_msg: >-
+              {{ inventory_hostname }} ({{ agent_state.os }}, build {{ agent_state.build }}, PowerShell {{ agent_state.ps }}):
+              {% if (agent_state.ps.split('.')[0] | int) < 5 %}нужен PowerShell 5.1 (WMF 5.1);{% endif %}
+              {% if agent_state.language_mode != 'FullLanguage' %}PowerShell в режиме {{ agent_state.language_mode }} (AppLocker/WDAC);{% endif %}
+              {% if agent_mode == 'broken' %}{{ new_dir }} или служба {{ new_service }} есть, но без conf\buildAgent.properties —
+              недоделанная установка: удалите её ({{ work_dir }}\teamcity-agent-windows-remove-new.ps1 -Yes) и запустите снова;{% endif %}
+              политика выполнения по GPO: {{ agent_state.exec_policy }}.
+            quiet: true
+
+        - name: "2e. Старый агент найден и это действительно старый агент"
+          ansible.builtin.assert:
+            that:
+              - agent_mode != 'migrate' or (agent_state.old_conf | bool)
+              - (agent_state.old_services | length) <= 1 or old_dir_hint | length > 0
+              - not (agent_state.old_conf | bool) or (agent_state.old_build | int) < 200000
+              - not (agent_state.old_conf | bool) or (agent_state.old_server_url | lower) != (server_url | lower)
+              - not (agent_state.old_dir | default('') | lower).startswith(new_dir | lower)
+              - (agent_state.old_dir | default('') | length == 0) or not ((new_dir | lower) ~ '\\').startswith((agent_state.old_dir | lower | regex_replace('\\\\+$', '')) ~ '\\')
+            fail_msg: >-
+              {{ inventory_hostname }}: старый агент: каталог «{{ agent_state.old_dir | default('') }}»,
+              служб агентов {{ agent_state.old_services | length }} ({{ agent_state.old_services | map(attribute='name') | list }}),
+              BUILD {{ agent_state.old_build }}, serverUrl {{ agent_state.old_server_url | default('') }}.
+              Если служб несколько или каталог не C:\BuildAgent — задайте teamcity_agent_old_dir для этого хоста.
+            quiet: true
+
+        # disable-old выключает службы; задание планировщика или запись Run запустили бы
+        # старого агента снова после перезагрузки. Проверяем до любых изменений.
+        - name: "2e. Автозапуск старого агента — только служба"
+          ansible.builtin.assert:
+            that: >-
+              (keep_old | bool) or (autostart_checked | bool) or not (agent_state.old_conf | bool)
+              or (agent_state.old_autostart | default([]) | length) == 0
+            fail_msg: >-
+              {{ inventory_hostname }}: старый агент запускается ещё и отсюда: {{ agent_state.old_autostart | join('; ') }}.
+              Плейбук выключает только службу, и после перезагрузки старый агент вернулся бы.
+              Отключите это задание/запись (taskschd.msc, regedit … \Run) и запустите снова;
+              если проверили и так и нужно — -e teamcity_agent_old_autostart_checked=true. Ничего не изменено.
+            quiet: true
+
+        - name: "2f. Перед установкой: место, JAVA_TOOL_OPTIONS, пароль учётной записи службы"
+          when: agent_mode == 'migrate'
+          ansible.builtin.assert:
+            that:
+              - (agent_state.free_gb | float) >= 3
+              - (agent_state.java_tool_options | default('', true)) == ''
+              - (agent_state.java_options | default('', true)) == ''
+              - corretto_zip | length > 0
+              - not (agent_needs_password | bool) or (teamcity_agent_service_password | default('') | length > 0)
+            fail_msg: >-
+              {{ inventory_hostname }}: свободно {{ agent_state.free_gb }} ГБ (нужно от 3);
+              JAVA_TOOL_OPTIONS/_JAVA_OPTIONS заданы на машине (ломают проверку Java 21): «{{ agent_state.java_tool_options }}» «{{ agent_state.java_options }}»;
+              Corretto zip в files/teamcity-agent/jdk/: {{ 'есть' if corretto_zip | length > 0 else 'НЕТ' }};
+              служба старого агента работает от {{ (agent_state.old_service | default({}, true)).start_name | default('?') }} —
+              {{ 'нужен пароль: teamcity_agent_service_password для хоста (в vault)' if agent_needs_password | bool else 'пароль не нужен' }}.
+            quiet: true
+
+        # Как это делает скрипт (Invoke-WebRequest, TLS 1.2): иначе он пишет «недоступен» без причины.
+        - name: "2g. https нового сервера с этой машины"
+          ansible.windows.win_command:
+            argv: "{{ ps_file + [helper, '-Action', 'Probe', '-ServerUrl', server_url] }}"
+          register: agent_probe_raw
+          changed_when: false
+          failed_when: false
+
+        - name: "2h. Сервер доступен по https"
+          ansible.builtin.assert:
+            that: agent_probe.code | int > 0
+            fail_msg: >-
+              {{ inventory_hostname }}: {{ server_url }} недоступен ({{ agent_probe.status }}).
+              TrustFailure — нет корпоративного УЦ; SecureChannelFailure/SendFailure — TLS;
+              NameResolutionFailure — DNS; ConnectFailure/Timeout — сеть/firewall.
+            quiet: true
+          vars:
+            agent_probe: "{{ ((agent_probe_raw.stdout_lines | select('match', tcjson) | list | first | default('TCJSON {\"code\":0,\"status\":\"no output\"}'))[7:]) | from_json }}"
+
+        # --- 3. Новый агент рядом со старым ---------------------------------------------
+        - name: "3. Установка нового агента (teamcity-agent-windows-migrate.ps1)"
+          when: agent_mode == 'migrate'
+          block:
+            - name: "3a. Дистрибутив агента и Java 21 (~600 МБ; повторно — только изменившееся)"
+              ansible.windows.win_copy:
+                src: "{{ item }}"
+                dest: "{{ work_dir }}\\{{ item | basename }}"
+              loop:
+                - "{{ agent_build }}/buildAgentFull-https.zip"
+                - "{{ corretto_zip }}"
+              throttle: "{{ teamcity_agents_copy_parallel | default(2) | int }}"
+
+            - name: "3b. Проверка (-Check)"
+              ansible.windows.win_command:
+                argv: "{{ ps_file + [wd_migrate, '-Check', '-KeepOldService', '-ServerUrl', server_url,
+                          '-Zip', wd_zip, '-Jdk', wd_jdk] + old_dir_arg }}"
+                chdir: "{{ work_dir }}"
+              register: agent_check
+              changed_when: false
+              failed_when: false
+
+            - name: "3c. Результат проверки"
+              ansible.builtin.debug:
+                msg: "{{ agent_check.stdout_lines }}"
+              when: agent_check.rc != 0 or (teamcity_agents_verbose | default(false) | bool)
+
+            - name: "3d. Проверка без блокирующих замечаний"
+              ansible.builtin.assert:
+                that: agent_check.rc == 0
+                fail_msg: "{{ inventory_hostname }}: скрипт нашёл, что мешает установке (выше), код {{ agent_check.rc }}. Ничего не изменено."
+                quiet: true
+
+            - name: "3e. Имя журнала установки"
+              ansible.builtin.set_fact:
+                agent_migrate_log: "{{ work_dir }}\\migrate-{{ now(fmt='%Y%m%d-%H%M%S') }}.log"
+
+            # Старый агент не трогается (-KeepOldService): выключим его, только когда новый
+            # зарегистрируется. Пароль службы — через окружение (скрипт читает и сразу удаляет).
+            # Весь вывод скрипта — только в журнал на агенте (в нём строки журнала агента
+            # с токеном), сюда — последние строки со скрытыми токенами (3f).
+            - name: "3e. Установка (журнал: {{ agent_migrate_log }})"
+              ansible.windows.win_shell: |
+                $ErrorActionPreference = 'Continue'
+                & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '{{ wd_migrate }}' `
+                  -Yes -KeepOldService -ServerUrl '{{ server_url }}' -Zip '{{ wd_zip }}' -Jdk '{{ wd_jdk }}' {{ ("-OldDir '" ~ agent_state.old_dir ~ "'") if (agent_state.old_dir | default('') | length > 0) else '' }} *> '{{ agent_migrate_log }}'
+                exit $LASTEXITCODE
+              environment: "{{ {'TC_AGENT_SERVICE_PASSWORD': teamcity_agent_service_password} if (agent_needs_password | bool) else {} }}"
+              register: agent_migrate
+              changed_when: true
+              failed_when: false
+              no_log: true
+              async: 3600
+              poll: 15
+              throttle: "{{ teamcity_agents_parallel | default(1) | int }}"
+
+            - name: "3f. Журнал установки (последние строки, токены скрыты)"
+              ansible.windows.win_shell: |
+                $log = '{{ agent_migrate_log }}'
+                if (-not (Test-Path -LiteralPath $log)) { "нет журнала $log"; exit 0 }
+                Get-Content -LiteralPath $log -Tail 40 | ForEach-Object {
+                  ([string]$_) -replace "(authorization token ')[^']*", '$1***' -replace '(authorizationToken\s*[=:]\s*)\S+', '$1***' -replace '[0-9A-Fa-f]{32,}', '***'
+                }
+              register: agent_migrate_log_tail
+              changed_when: false
+              failed_when: false
+
+            - name: "3g. Вывод установки"
+              ansible.builtin.debug:
+                msg: "{{ agent_migrate_log_tail.stdout_lines | default([]) }}"
+              when: (agent_migrate.rc | default(1)) != 0 or (teamcity_agents_verbose | default(false) | bool)
+
+            # Код 0 сам по себе не значит «установлен»: проверяем журнал регистрации агента.
+            - name: "3h. Новый агент зарегистрировался на сервере (до 5 минут)"
+              ansible.windows.win_command:
+                argv: "{{ ps_file + [helper, '-Action', 'Wait', '-Dir', new_dir, '-WaitSec', '300'] }}"
+              register: agent_wait_raw
+              changed_when: false
+              failed_when: false
+              when: (agent_migrate.rc | default(1)) == 0
+              async: 900
+              poll: 15
+
+            - name: "3i. Итог установки"
+              ansible.builtin.set_fact:
+                agent_install_ok: >-
+                  {{ (agent_migrate.rc | default(1)) == 0 and (agent_wait_raw.rc | default(1)) == 0 }}
+                agent_install_tls: >-
+                  {{ 'tls_error\":true' in (agent_wait_raw.stdout | default('', true)) }}
+
+            # Старый агент не трогался — недоделанную установку можно убрать без риска.
+            # Только при известном ненулевом коде: без кода установка, может быть, ещё идёт.
+            - name: "3j. Неудача: убрать недоделанного нового агента (старый работает как раньше)"
+              ansible.windows.win_command:
+                argv: "{{ ps_file + [wd_remove, '-Yes'] }}"
+                chdir: "{{ work_dir }}"
+              register: agent_remove_new
+              failed_when: false
+              when:
+                - not (agent_install_ok | bool)
+                - agent_migrate.rc is defined
+                - agent_migrate.rc != 0
+
+            - name: "3k. Установка удалась"
+              ansible.builtin.assert:
+                that: agent_install_ok | bool
+                fail_msg: >-
+                  {{ inventory_hostname }}:
+                  {% if agent_migrate.rc is not defined %}результат установки неизвестен (асинхронный запуск не подтвердился) —
+                  ничего не удалено; проверьте {{ new_dir }} и журнал {{ agent_migrate_log }}, затем запустите снова.
+                  {% elif agent_migrate.rc != 0 %}установка не удалась (код {{ agent_migrate.rc }}, журнал выше);
+                  недоделанный агент удалён ({{ 'да' if (agent_remove_new.rc | default(1)) == 0 else 'НЕТ — смотрите вручную' }}), старый работает.
+                  {% else %}агент установлен, но не зарегистрировался за 5 минут{{ ' — ошибка сертификата (PKIX): проверьте conf\\trustedCertificates' if agent_install_tls | bool else '' }};
+                  старый агент НЕ выключен. Журнал: {{ new_dir }}\logs\teamcity-agent.log{% endif %}
+                quiet: true
+
+            - name: "3l. Новый агент на сервере"
+              ansible.builtin.set_fact:
+                agent_new_ready: true
+
+        # --- 4. Перенаправление уже перенесённого агента (и «уже готово») ------------------
+        # Код 0 у помощника — только с доказательством регистрации на этом сервере.
+        - name: "4. Перенаправить нового агента на {{ server_url }}"
+          when: agent_mode in ['repoint', 'done']
+          block:
+            - name: "4a. Сертификаты, serverUrl, перезапуск агентом самим собой (ждёт сборку до {{ agent_wait }} с)"
+              ansible.windows.win_command:
+                argv: "{{ ps_file + [helper, '-Action', 'Repoint', '-Dir', new_dir, '-NewService', new_service,
+                          '-ServerUrl', server_url, '-CertDir', work_dir, '-WaitSec', agent_wait | string] }}"
+              register: agent_repoint_raw
+              changed_when: >-
+                '"changed":true' in (agent_repoint_raw.stdout | default('', true))
+                or '"certs_changed":true' in (agent_repoint_raw.stdout | default('', true))
+              failed_when: false
+              async: "{{ agent_wait | int + 1200 }}"
+              poll: 15
+              throttle: "{{ teamcity_agents_parallel | default(1) | int }}"
+
+            - name: "4b. Результат"
+              ansible.builtin.debug:
+                msg: "{{ agent_repoint_raw.stdout_lines | default([]) }}"
+              when: (agent_repoint_raw.rc | default(1)) != 0 or (teamcity_agents_verbose | default(false) | bool)
+
+            - name: "4c. Перенаправлен и зарегистрирован (код 3 — идёт сборка, ничего не изменено)"
+              ansible.builtin.assert:
+                that: (agent_repoint_raw.rc | default(1)) in [0, 3]
+                fail_msg: >-
+                  {{ inventory_hostname }}: новый агент не зарегистрировался на {{ server_url }}
+                  (код {{ agent_repoint_raw.rc | default('?') }}, вывод выше) — старый агент НЕ выключен.
+                  Журнал: {{ new_dir }}\logs\teamcity-agent.log; копия прежнего файла — {{ new_dir }}\conf\buildAgent.properties.bak-repoint-*.
+                quiet: true
+
+        - name: "4d. Код после установки/перенаправления"
+          ansible.builtin.set_fact:
+            agent_rc: "{{ 0 if agent_mode == 'migrate' else (agent_repoint_raw.rc | default(1)) }}"
+            agent_new_ready: >-
+              {{ (agent_new_ready | bool) or (agent_mode in ['repoint', 'done'] and (agent_repoint_raw.rc | default(1)) == 0) }}
+
+        # Имя — сразу, как новый агент на сервере: авторизация не зависит от выключения старого.
+        - name: "4e. Имя нового агента"
+          ansible.windows.win_command:
+            argv: "{{ ps_file + [helper, '-Action', 'State', '-Dir', new_dir, '-NewService', new_service, '-ServerUrl', server_url] + old_dir_arg }}"
+          register: agent_state2_raw
+          changed_when: false
+          when: agent_new_ready | bool
+
+        - name: "4f. Имена старого и нового агента"
+          ansible.builtin.set_fact:
+            agent_old_name: "{{ agent_state.old_name | default('', true) }}"
+            agent_new_name: "{{ ((agent_state2_raw.stdout_lines | default([]) | select('match', tcjson) | list | first | default('TCJSON {}'))[7:] | from_json).new_name | default('', true) }}"
+          when: agent_new_ready | bool
+
+        # Ещё одно доказательство перед выключением старого: сервер видит нового подключённым.
+        - name: "4g. Сервер видит нового агента подключённым (REST, до 1 минуты)"
+          ansible.builtin.uri:
+            url: >-
+              {{ server_url }}/app/rest/agents?locator={{ ('name:' ~ agent_new_name ~ ',connected:true,authorized:any') | urlencode }}&fields=agent(id,name,connected)
+            headers:
+              Authorization: "Bearer {{ rest_token }}"
+              Accept: application/json
+            ca_path: "{{ hostvars['localhost'].agents_ca_file }}"
+          register: agent_rest_up
+          until: >-
+            (agent_rest_up.json.agent | default([]) | length) > 0
+            or (agent_rest_up.status | default(0)) in [401, 403, -1]
+          retries: 6
+          delay: 10
+          failed_when: false
+          delegate_to: localhost
+          no_log: true
+          when:
+            - agent_new_ready | bool
+            - not (keep_old | bool)
+            - agent_state.old_conf | bool
+            - agent_new_name | default('') | length > 0
+            - rest_token | length > 0
+
+        - name: "4h. REST недоступен — опора на журнал агента"
+          ansible.builtin.debug:
+            msg: >-
+              {{ server_url }}/app/rest: HTTP {{ agent_rest_up.status | default('?') }}
+              ({{ agent_rest_up.msg | default('') | truncate(200) }}) — проверьте vault_teamcity_admin_token и УЦ;
+              регистрация нового агента подтверждена по его журналу.
+          when:
+            - agent_rest_up is defined
+            - agent_rest_up is not skipped
+            - (agent_rest_up.status | default(0)) != 200
+
+        - name: "4i. Новый агент подключён — можно выключать старого"
+          ansible.builtin.assert:
+            that: >-
+              agent_rest_up is not defined or agent_rest_up is skipped
+              or (agent_rest_up.status | default(0)) != 200
+              or (agent_rest_up.json.agent | default([]) | length) > 0
+            fail_msg: >-
+              {{ inventory_hostname }}: {{ agent_new_name }} по журналу зарегистрировался, но сервер не видит его подключённым —
+              старый агент НЕ выключен. Проверьте Agents и {{ new_dir }}\logs\teamcity-agent.log, затем запустите снова.
+            quiet: true
+
+        # --- 5. Выключить старого агента (новый уже на сервере) -----------------------------
+        - name: "5. Выключить старого агента"
+          when:
+            - agent_new_ready | bool
+            - agent_rc | int == 0
+            - not (keep_old | bool)
+            - agent_state.old_conf | bool
+          block:
+            - name: "5a. Сохранить состояние службы старого агента (для отката)"
+              ansible.windows.win_command:
+                argv: "{{ ps_file + [helper, '-Action', 'SaveOld', '-Dir', new_dir, '-NewService', new_service,
+                          '-OldDir', agent_state.old_dir, '-Out', wd_oldjson] }}"
+              changed_when: false
+
+            - name: "5b. Ждём, пока на старом агенте нет сборки (до {{ agent_wait }} с)"
+              ansible.windows.win_command:
+                argv: "{{ ps_file + [helper, '-Action', 'Idle', '-Dir', agent_state.old_dir, '-WaitSec', agent_wait | string] }}"
+              register: agent_old_idle
+              changed_when: false
+              failed_when: false
+              async: "{{ agent_wait | int + 600 }}"
+              poll: 15
+
+            - name: "5c. teamcity-agent-windows-disable-old.ps1 (журнал: {{ work_dir }}\\disable-old-*.log)"
+              ansible.windows.win_shell: |
+                $ErrorActionPreference = 'Continue'
+                $log = Join-Path '{{ work_dir }}' ('disable-old-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
+                & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '{{ wd_disable }}' `
+                  -Yes -OldDir '{{ agent_state.old_dir }}' -NewDir '{{ new_dir }}' -NewServiceName '{{ new_service }}' 2>&1 |
+                  Tee-Object -FilePath $log
+                exit $LASTEXITCODE
+              register: agent_disable_old
+              changed_when: >-
+                (agent_disable_old.rc | default(1)) == 0
+                and 'уже выключен' not in (agent_disable_old.stdout | default('', true))
+              failed_when: false
+              when: (agent_old_idle.rc | default(1)) == 0
+              async: 900
+              poll: 15
+              throttle: "{{ teamcity_agents_parallel | default(1) | int }}"
+
+            # Сборка, начавшаяся между проверкой и остановкой, даёт код 1 — уточняем через -Check.
+            - name: "5d. Уточнить код (сборка началась в последний момент?)"
+              ansible.windows.win_command:
+                argv: "{{ ps_file + [wd_disable, '-Check',
+                          '-OldDir', agent_state.old_dir, '-NewDir', new_dir, '-NewServiceName', new_service] }}"
+              register: agent_disable_recheck
+              changed_when: false
+              failed_when: false
+              when: (agent_disable_old.rc | default(0)) == 1
+
+            - name: "5e. Вывод выключения старого агента"
+              ansible.builtin.debug:
+                msg: "{{ agent_disable_old.stdout_lines | default([]) }}"
+              when: (agent_disable_old.rc | default(0)) != 0 or (teamcity_agents_verbose | default(false) | bool)
+
+            - name: "5f. Старый агент выключен: службы остановлены и отключены, процессов и автозапуска нет"
+              ansible.windows.win_command:
+                argv: "{{ ps_file + [helper, '-Action', 'OldOff', '-Dir', new_dir, '-NewService', new_service, '-OldDir', agent_state.old_dir] }}"
+              register: agent_old_off
+              changed_when: false
+              failed_when: false
+              when:
+                - (agent_old_idle.rc | default(1)) == 0
+                - (agent_disable_old.rc | default(1)) == 0
+
+            - name: "5g. Код выключения старого агента"
+              ansible.builtin.set_fact:
+                agent_rc: >-
+                  {{ 3 if ((agent_old_idle.rc | default(1)) == 3 or (agent_disable_old.rc | default(0)) == 3
+                           or (agent_disable_recheck.rc | default(0)) == 3)
+                     else (0 if (agent_old_off.rc | default(1)) == 0 else 1) }}
+
+            - name: "5h. Старый агент выключен (код 3 — идёт сборка, ничего не прервано)"
+              ansible.builtin.assert:
+                that: agent_rc | int in [0, 3]
+                fail_msg: >-
+                  {{ inventory_hostname }}: новый агент работает, но старого выключить не удалось
+                  (disable-old код {{ agent_disable_old.rc | default('?') }}; ожидание: {{ agent_old_idle.stdout | default('') | trim }};
+                  проверка: {{ agent_old_off.stdout | default('') | trim }}).
+                  Состояние старой службы для отката: {{ work_dir }}\old-service.json.
+                quiet: true
+
+        # --- 6. Итог ------------------------------------------------------------------------
+        - name: "6. Итог по агенту"
+          ansible.builtin.set_fact:
+            agent_status: >-
+              {%- set what = {'migrate': 'перенесён (новый агент рядом со старым)', 'repoint': 'перенаправлен на новый сервер',
+                              'done': 'уже на новом сервере'}[agent_mode] -%}
+              {%- if not (agent_new_ready | bool) -%}ЖДЁТ СБОРКУ на новом агенте — ничего не изменено, запустите плейбук для него позже
+              {%- elif (agent_rc | int) == 3 -%}{{ what }}; старый агент ещё занят сборкой — запустите плейбук позже, чтобы выключить его
+              {%- elif keep_old | bool -%}{{ what }}, старый оставлен (keep_old)
+              {%- elif not (agent_state.old_conf | bool) -%}{{ what }}; старый агент не найден — проверьте вручную (teamcity_agent_old_dir)
+              {%- else -%}{{ what }}, старый выключен
+              {%- endif -%}
+      rescue:
+        - name: Ошибка на этом агенте — в итог (остальные агенты продолжают)
+          ansible.builtin.set_fact:
+            agent_rc: 1
+            agent_status: >-
+              {{ ('новый агент работает, авторизуется; ' if (agent_new_ready | default(false) | bool) else '')
+                 ~ 'ОШИБКА («' ~ (ansible_failed_task.name | default('?')) ~ '»): '
+                 ~ ((ansible_failed_result.msg | default('см. вывод выше', true)) | string | regex_replace('\\s+', ' ') | truncate(400))
+                 ~ ((' — ' ~ (ansible_failed_result.stdout_lines | default([]) | select | list)[-2:] | join(' | ')) | truncate(400)
+                    if (ansible_failed_result.stdout_lines | default([]) | select | list | length > 0) else '') }}
+
+- name: Authorize migrated Windows agents in TeamCity
+  ansible.builtin.import_playbook: tasks/agents-authorize-play.yml
+  vars:
+    agents_group: teamcity_agents_windows

@@ -1,0 +1,702 @@
+---
+# ===========================================================================
+# 61 — Перенос Linux-агентов TeamCity на новый сервер (https). Все агенты сразу — 60.
+#
+# На каждом агенте запускается files/teamcity-agent/linux/teamcity-agent-linux-migrate.sh
+# (docs/teamcity-agent-linux-migrate.md): новый агент 2026 ставится РЯДОМ со старым
+# (/opt/buildAgent2026, служба teamcity-agent2026, Java 21 из пакета teamcity-agent-jdk21),
+# переносит параметры старого агента, штатно останавливает старого после текущей сборки
+# и выключает его автозапуск. Каталог старого агента не меняется; при сбое скрипт сам
+# возвращает старого агента.
+#
+# Агент, уже перенесённый этими скриптами на ДРУГОЙ сервер (например, тестовый
+# http://172.17.6.61:8111, с --keep-old), не ставится заново: плейбук перенаправляет его —
+# serverUrl на новый адрес, УЦ в conf/trustedCertificates, перезапуск после сборки, —
+# и выключает старого агента 2018 скриптом teamcity-agent-linux-disable-old.sh.
+#
+# Плейбук добавляет:
+#   - https: в buildAgentFull.zip кладётся корпоративный УЦ (conf/trustedCertificates) —
+#     агент доверяет серверу сразу, Java не меняется; УЦ ставится и в систему (curl);
+#   - сам перенос — по одному агенту (throttle); сбой или недоступность одного агента не
+#     останавливает остальных: причина — в итоге, хост помечается упавшим в самом конце;
+#   - перенаправление считается успешным только с «Registered on server» в журнале агента,
+#     иначе прежний buildAgent.properties возвращается; старый агент — только после этого;
+#   - авторизация нового агента и пул старого агента (REST, нужен vault_teamcity_admin_token);
+#   - итог по каждому агенту.
+#
+# На агентах Python не нужен (Debian 9 тоже): только SSH (raw) и scp.
+#
+# Запуск (первый раз — с паролем root, плейбук разложит SSH-ключ):
+#   ansible-playbook playbooks/61-teamcity-agents-linux.yml --limit ba-deb12-01 \
+#     --ask-pass --ask-vault-pass -e agents_confirm=yes
+# Репетиция без остановки старых агентов: -e teamcity_agents_keep_old=true
+# ===========================================================================
+
+- name: Prepare agent distribution on control node
+  hosts: teamcity_agents_linux
+  gather_facts: false
+  vars:
+    agent_files: "{{ playbook_dir }}/../files/teamcity-agent"
+    agent_build: "{{ agent_files }}/build"
+    ca_file: "{{ playbook_dir }}/../files/ca/ca.crt"
+    tls_src_dir: "{{ playbook_dir }}/../files/tls"
+    agent_required_files:
+      - "{{ agent_files }}/linux/teamcity-agent-linux-migrate.sh"
+      - "{{ agent_files }}/linux/teamcity-agent-linux-disable-old.sh"
+    agent_payload_files: >-
+      {{ agent_required_files + query('fileglob', agent_files ~ '/jdk/teamcity-agent-jdk21_*.deb') }}
+  tasks:
+    - name: Prepare
+      ansible.builtin.import_tasks: tasks/agent-prepare.yml
+
+- name: Migrate Linux agents to the new server
+  hosts: teamcity_agents_linux
+  gather_facts: false
+  # Без serial: сбой одного агента не останавливает остальных. Сам перенос и
+  # перенаправление — строго по одному агенту (throttle), копирование — по нескольку.
+  # Ошибка хоста попадает в итог (rescue), хост падает в самом конце — после авторизации остальных.
+  vars:
+    agent_files: "{{ playbook_dir }}/../files/teamcity-agent"
+    agent_build: "{{ agent_files }}/build"
+    ca_file: "{{ playbook_dir }}/../files/ca/ca.crt"
+    work_dir: /root/teamcity-agent-migrate
+    server_url: "{{ hostvars['localhost'].agents_server_url }}"
+    old_dir: "{{ teamcity_agent_old_dir | default('/opt/buildAgent', true) }}"
+    new_dir: /opt/buildAgent2026
+    new_service: teamcity-agent2026
+    agent_wait: "{{ teamcity_agents_wait | default(600) | int }}"
+    keep_old: "{{ teamcity_agents_keep_old | default(false) | bool }}"
+    autostart_checked: "{{ teamcity_agent_rpm_autostart_checked | default(false) | bool }}"
+    server_host: "{{ server_url | urlsplit('hostname') }}"
+    # RPM-системы (ROSA): Java 21 — тем же JDK, что в .deb, но архивом (собирается из .deb).
+    jdk_tarball: "{{ teamcity_agent_jdk_tarball | default(agent_build ~ '/teamcity-agent-jdk21-linux-x64.tar.gz', true) }}"
+    ssh_pubkey_path: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+    ssh_privkey_path: "{{ ssh_pubkey_path | regex_replace('\\.pub$', '') }}"
+    src_sums: "{{ hostvars[ansible_play_hosts_all[0]].agent_src_sums.results | default([]) }}"
+    server_pem: >-
+      {{ src_sums | map(attribute='stat') | selectattr('exists') | map(attribute='path')
+         | select('search', '/trusted/teamcity-server[.]pem$') | list | first | default('') }}
+    script_args: >-
+      --server {{ server_url | quote }} --zip {{ (work_dir ~ '/buildAgentFull-https.zip') | quote }}
+      --old-dir {{ old_dir | quote }}
+      {{ ('--user ' ~ (teamcity_agent_user | quote)) if (teamcity_agent_user | default('') | length > 0) else '' }}
+      {{ '--keep-old' if (teamcity_agents_keep_old | default(false) | bool) else '' }}
+    disable_args: >-
+      --server {{ server_url | quote }} --old-dir {{ old_dir | quote }} --new-dir {{ new_dir }} --service {{ new_service }}
+    # Идёт ли сборка на новом агенте: последняя метка в журнале (и в .1-.3, если в текущем меток нет),
+    # но только при живом процессе агента — метка «Starting Build» может остаться после сбоя.
+    # grep -a / LC_ALL=C: после сбоя в журнале бывают NUL-байты, обычный grep тогда молчит.
+    busy_sh: |
+      busy() {
+        _d={{ new_dir }}
+        _p=$(cat "$_d/logs/buildAgent.pid" 2>/dev/null) || _p=
+        case "$_p" in ''|*[!0-9]*) return 1 ;; esac
+        [ -e "/proc/$_p" ] && [ "$(readlink "/proc/$_p/cwd" 2>/dev/null)" = "$_d/bin" ] || return 1
+        for _log in "$_d/logs/teamcity-agent.log" "$_d/logs/teamcity-agent.log.1" "$_d/logs/teamcity-agent.log.2" "$_d/logs/teamcity-agent.log.3"; do
+          [ -f "$_log" ] && [ ! -L "$_log" ] || continue
+          _l=$(LC_ALL=C grep -aE ' - (Starting Build [{]id=[0-9]+|Build finished, build id [0-9]+|Build detached from agent, build id [0-9]+|Build agent started)' "$_log" 2>/dev/null | LC_ALL=C tr -d '\000' | tail -n 1)
+          [ -n "$_l" ] || continue
+          case "$_l" in *"Starting Build"*) return 0 ;; *) return 1 ;; esac
+        done
+        return 1
+      }
+  tasks:
+    - name: Агент обрабатывается в этом запуске
+      ansible.builtin.set_fact:
+        agent_attempted: true
+        agent_rc: -1
+        agent_new_ready: false
+
+    - name: Read inventory/vault.yml when present
+      ansible.builtin.include_vars:
+        file: "{{ inventory_dir }}/vault.yml"
+      when: query('fileglob', inventory_dir ~ '/vault.yml') | length > 0
+      no_log: true
+
+    - name: "Перенос агента {{ inventory_hostname }}"
+      block:
+        # --- 1. Доступ ------------------------------------------------------------
+        # Недоступный хост — в итог, а не «unreachable»: иначе, когда недоступны все,
+        # Ansible пропустил бы и следующие play (Windows, авторизацию).
+        - name: "1a. Вход под root"
+          ansible.builtin.raw: id -u
+          register: agent_uid
+          changed_when: false
+          failed_when: false
+          ignore_unreachable: true
+
+        - name: "1a. Вход удался, пользователь root"
+          ansible.builtin.fail:
+            msg: >-
+              {{ inventory_hostname }}:
+              {{ ('НЕДОСТУПЕН по SSH — ' ~ (agent_uid.msg | default(''))) if (agent_uid.unreachable | default(false) | bool)
+                 else ('вход не под root (id -u: ' ~ (agent_uid.stdout | default('') | trim) ~ ')') }}
+          when: >-
+            (agent_uid.unreachable | default(false) | bool)
+            or (agent_uid.rc | default(1)) != 0 or (agent_uid.stdout | default('') | trim) != '0'
+
+        - name: "1b. SSH-ключ control node для root (дальше — без пароля)"
+          ansible.builtin.raw: |
+            set -e
+            key={{ lookup('file', ssh_pubkey_path) | quote }}; f=/root/.ssh/authorized_keys
+            mkdir -p /root/.ssh && chmod 700 /root/.ssh
+            touch "$f" && chmod 600 "$f"
+            if grep -qxF "$key" "$f"; then echo same; else
+              # последняя строка без перевода строки — иначе ключ приклеится к ней (как в ssh-copy-id)
+              if [ -s "$f" ] && [ -n "$(tail -c 1 "$f")" ]; then echo >> "$f"; fi
+              printf '%s\n' "$key" >> "$f"; echo changed
+            fi
+          register: agent_key
+          changed_when: "'changed' in agent_key.stdout"
+
+        # Новый агент уже стоит и смотрит на другой сервер (перенесён раньше) — перенаправляем.
+        - name: "1c. Новый агент уже установлен?"
+          ansible.builtin.raw: |
+            f={{ new_dir }}/conf/buildAgent.properties
+            if [ -f "$f" ]; then sed -n 's/^[[:space:]]*serverUrl[[:space:]]*[=:][[:space:]]*//p' "$f" | tail -n 1 | sed 's/\\\([:=]\)/\1/g'; else echo NONE; fi
+          register: agent_new_url
+          changed_when: false
+
+        - name: "1d. Режим: установка (migrate) или перенаправление (repoint)"
+          ansible.builtin.set_fact:
+            agent_mode: >-
+              {{ 'repoint' if (cur not in ['', 'NONE'] and (cur | regex_replace('/+$', '')) != server_url) else 'migrate' }}
+            # Java 21 нужна только для новой установки: у перенесённого агента она уже есть.
+            agent_needs_jdk: "{{ cur in ['', 'NONE'] }}"
+          vars:
+            cur: "{{ agent_new_url.stdout | trim }}"
+
+        # --- 2. Система и Java ----------------------------------------------------
+        # Скрипты требуют bash >= 4.4 (mapfile -d) и systemd >= 230 (systemctl show --value):
+        # на RHEL 7-подобных (ROSA 7.x/Cobalt) они дают ложный успех — такие хосты не трогаем.
+        - name: "2a. Система: пакеты, bash, systemd, glibc, Java, имя сервера"
+          ansible.builtin.raw: |
+            fam=other; libc=
+            if command -v dpkg-query >/dev/null 2>&1; then fam=deb; libc=$(dpkg-query -W -f='${Version}' libc6 2>/dev/null)
+            elif command -v rpm >/dev/null 2>&1; then fam=rpm; fi
+            glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')
+            bv=$(bash -c 'echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}' 2>/dev/null)
+            sv=$(systemctl --version 2>/dev/null | awk 'NR==1{print $2}')
+            sr=no; [ -d /run/systemd/system ] && sr=yes
+            os=$(. /etc/os-release 2>/dev/null; echo ${ID:-?}-${VERSION_ID:-?})
+            http=$(command -v curl || command -v wget || command -v python3 || echo none)
+            dns=fail; getent hosts {{ server_host | quote }} >/dev/null 2>&1 && dns=ok
+            jdk=; [ -x /opt/teamcity-agent-jdk21/bin/java ] && jdk=$(sed -n 's/^JAVA_VERSION=[^0-9]*\([0-9]*\).*/\1/p' /opt/teamcity-agent-jdk21/release 2>/dev/null | head -n 1)
+            printf '%s\n' family=$fam libc=$libc glibc=$glibc bash=$bv systemd=$sv systemd_running=$sr os=$os http=$http dns=$dns jdk=$jdk
+          register: agent_sys_raw
+          changed_when: false
+
+        - name: "2b. Разбор"
+          ansible.builtin.set_fact:
+            agent_sys: "{{ dict(agent_sys_raw.stdout_lines | map('trim') | select('search', '^[a-z_]+=') | map('split', '=', 1)) }}"
+
+        - name: "2c. Система подходит"
+          ansible.builtin.assert:
+            that:
+              - agent_sys.family in ['deb', 'rpm']
+              - agent_sys.bash | default('0.0', true) is version('4.4', '>=')
+              - agent_sys.systemd | default('0', true) | int >= 230
+              - agent_sys.systemd_running == 'yes'
+              - agent_sys.glibc | default('0', true) is version('2.17', '>=')
+              - agent_sys.http != 'none'
+              - agent_sys.dns == 'ok'
+            fail_msg: >-
+              {{ inventory_hostname }} ({{ agent_sys.os }}): пакеты {{ agent_sys.family }}, bash {{ agent_sys.bash }} (нужен 4.4+),
+              systemd {{ agent_sys.systemd }} (нужен 230+, запущен: {{ agent_sys.systemd_running }}), glibc {{ agent_sys.glibc }} (нужен 2.17+),
+              curl/wget/python3: {{ agent_sys.http }}, имя {{ server_host }}: {{ agent_sys.dns }}.
+              {{ 'RHEL 7-подобная система (ROSA 7.x/Cobalt) — скрипты переноса здесь не работают, переносите вручную.' if agent_sys.family == 'rpm' and not ((agent_sys.bash | default('0.0', true)) is version('4.4', '>=')) else '' }}
+              {{ 'Имя сервера не разрешается: проверьте DNS (getent hosts ' ~ server_host ~ ').' if agent_sys.dns != 'ok' else '' }}
+            quiet: true
+
+        - name: "2d. Нужна ли Java 21"
+          ansible.builtin.set_fact:
+            agent_jdk_missing: "{{ (agent_needs_jdk | bool) and not ((agent_sys.jdk | default('', true) | int) in range(21, 26)) }}"
+
+        # Debian: libc6 >= 2.36 (Debian 12+) — обычный пакет, старше — пакет ~deb9 (та же Java).
+        - name: "2e. Подходящий пакет Java 21 (Debian/Ubuntu/Astra)"
+          ansible.builtin.set_fact:
+            agent_deb: >-
+              {{ (src_sums | map(attribute='stat') | selectattr('exists') | map(attribute='path')
+                  | select('search', '/teamcity-agent-jdk21_[^/]*' ~ ('~deb9' if (old_libc | bool) else '[0-9]-[0-9]+_') ~ '[^/]*amd64[.]deb$')
+                  | list | first | default(''))
+                 if agent_sys.family == 'deb' else '' }}
+          vars:
+            old_libc: "{{ not (((agent_sys.libc | default('0', true)).split('-')[0]) is version('2.36', '>=')) }}"
+
+        - name: "2f. Java 21 будет откуда взять"
+          when: agent_jdk_missing | bool
+          ansible.builtin.assert:
+            that: >-
+              (agent_sys.family == 'deb' and agent_deb | length > 0)
+              or (agent_sys.family == 'rpm' and (query('fileglob', jdk_tarball) | length > 0
+                  or query('fileglob', agent_files ~ '/jdk/teamcity-agent-jdk21_*.deb') | length > 0))
+            fail_msg: >-
+              {{ inventory_hostname }}: нет Java 21 в /opt/teamcity-agent-jdk21 и нечем поставить:
+              {% if agent_sys.family == 'deb' %}нужен teamcity-agent-jdk21_*{{ '~deb9' if not (((agent_sys.libc | default('0', true)).split('-')[0]) is version('2.36', '>=')) else '' }}_amd64.deb
+              в files/teamcity-agent/jdk/{% else %}нужен любой teamcity-agent-jdk21_*.deb в files/teamcity-agent/jdk/
+              (из него соберётся архив JDK для RPM-системы){% endif %} (см. files/teamcity-agent/README.md).
+            quiet: true
+
+        # --- 3. Файлы на агенте ----------------------------------------------------
+        - name: "3a. Рабочий каталог {{ work_dir }}"
+          ansible.builtin.raw: |
+            set -e
+            mkdir -p {{ work_dir }} && chown root:root {{ work_dir }} && chmod 700 {{ work_dir }}
+            # Только нужный пакет Java: скрипт берёт новейший .deb рядом с собой.
+            for f in {{ work_dir }}/teamcity-agent-jdk21_*.deb; do
+              [ -e "$f" ] || continue
+              [ "$(basename "$f")" = {{ agent_deb | basename | quote }} ] || rm -f "$f"
+            done
+            cd {{ work_dir }} && sha256sum teamcity-agent-linux-migrate.sh teamcity-agent-linux-disable-old.sh buildAgentFull-https.zip \
+              elara-ca.crt teamcity-server.pem {{ agent_deb | basename | quote }} 2>/dev/null || true
+          register: agent_remote_sums
+          changed_when: false
+
+        - name: "3b. Копирование изменившихся файлов (scp)"
+          ansible.builtin.command:
+            argv:
+              - scp
+              - -q
+              - -i
+              - "{{ ssh_privkey_path }}"
+              - -o
+              - BatchMode=yes
+              - -o
+              - StrictHostKeyChecking=accept-new
+              - -P
+              - "{{ ansible_port | default(22) }}"
+              - "{{ item.src }}"
+              - "root@{{ ansible_host | default(inventory_hostname) }}:{{ work_dir }}/{{ item.dest }}"
+          loop: >-
+            {{ [{'src': agent_files ~ '/linux/teamcity-agent-linux-migrate.sh', 'dest': 'teamcity-agent-linux-migrate.sh'},
+                {'src': agent_files ~ '/linux/teamcity-agent-linux-disable-old.sh', 'dest': 'teamcity-agent-linux-disable-old.sh'},
+                {'src': agent_build ~ '/buildAgentFull-https.zip', 'dest': 'buildAgentFull-https.zip'},
+                {'src': ca_file, 'dest': 'elara-ca.crt'}]
+               + ([{'src': server_pem, 'dest': 'teamcity-server.pem'}] if (server_pem | length > 0) else [])
+               + ([{'src': agent_deb, 'dest': agent_deb | basename}] if (agent_jdk_missing | bool and agent_deb | length > 0) else []) }}
+          loop_control:
+            label: "{{ item.dest }}"
+          when: >-
+            ((src_sums | selectattr('stat.path', 'equalto', item.src) | map(attribute='stat.checksum') | first | default('x'))
+              ~ '  ' ~ item.dest) not in (agent_remote_sums.stdout_lines | map('trim') | list)
+          delegate_to: localhost
+          changed_when: true
+          throttle: "{{ teamcity_agents_copy_parallel | default(3) | int }}"
+
+        # curl в скрипте проверяет сервер по https — система должна доверять УЦ.
+        # Debian/Ubuntu/Astra — update-ca-certificates; RHEL-подобные (ROSA) — update-ca-trust.
+        - name: "3c. Корпоративный УЦ в системе агента"
+          ansible.builtin.raw: |
+            set -e
+            src={{ work_dir }}/elara-ca.crt
+            if command -v update-ca-certificates >/dev/null 2>&1; then
+              mkdir -p /usr/local/share/ca-certificates
+              dst=/usr/local/share/ca-certificates/elara-teamcity-ca.crt; upd="update-ca-certificates"
+            elif command -v update-ca-trust >/dev/null 2>&1; then
+              mkdir -p /etc/pki/ca-trust/source/anchors
+              dst=/etc/pki/ca-trust/source/anchors/elara-teamcity-ca.crt; upd="update-ca-trust extract"
+            else
+              echo "нет update-ca-certificates и update-ca-trust — добавьте УЦ в систему вручную"; exit 1
+            fi
+            if [ -f "$dst" ] && cmp -s "$src" "$dst"; then echo same; exit 0; fi
+            install -m 0644 "$src" "$dst"
+            $upd >/dev/null
+            echo changed
+          register: agent_ca
+          changed_when: "'changed' in agent_ca.stdout"
+
+        # Тем же способом, что и скрипт (curl/wget/python3): 000 — нет связи/доверия к сертификату.
+        - name: "3d. https нового сервера с этой машины"
+          ansible.builtin.raw: |
+            u={{ (server_url ~ '/login.html') | quote }}
+            if command -v curl >/dev/null 2>&1; then
+              c=$(curl -s -o /dev/null -I -w '%{http_code}' --connect-timeout 10 -m 20 "$u" 2>/dev/null) || true
+            elif command -v wget >/dev/null 2>&1; then
+              c=$(wget -S --spider -T 15 -t 1 "$u" 2>&1 | LC_ALL=C awk '$1 ~ /^HTTP\// {c=$2} END {print c}')
+            else
+              c=$(python3 -c 'import sys,urllib.request
+            try: print(urllib.request.urlopen(sys.argv[1], timeout=20).status)
+            except Exception as e: print(getattr(e, "code", "000"))' "$u")
+            fi
+            echo "code=${c:-000}"
+          register: agent_https
+          changed_when: false
+          failed_when: "'code=000' in agent_https.stdout"
+
+        # --- 3e. Java 21 архивом для RPM-систем (ROSA): тот же JDK, что в .deb ----------
+        - name: "3e. Java 21 для RPM-системы"
+          when:
+            - agent_sys.family == 'rpm'
+            - agent_jdk_missing | bool
+          block:
+            - name: "3e-1. Архив JDK из .deb (control node, один раз)"
+              ansible.builtin.command:
+                argv:
+                  - python3
+                  - -I
+                  - -c
+                  - |
+                    import io, lzma, os, sys, tarfile
+                    deb, out = sys.argv[1], sys.argv[2]
+                    data = open(deb, 'rb').read()
+                    if not data.startswith(b'!<arch>\n'):
+                        sys.exit(deb + ': не .deb (указатель Git LFS?)')
+                    pos, payload = 8, None
+                    while pos < len(data):
+                        name = data[pos:pos + 16].decode().strip().rstrip('/'); size = int(data[pos + 48:pos + 58])
+                        body = data[pos + 60:pos + 60 + size]; pos += 60 + size + (size & 1)
+                        if name.startswith('data.tar'):
+                            payload = lzma.decompress(body) if name.endswith('.xz') else body
+                    if payload is None:
+                        sys.exit('в .deb нет data.tar')
+                    tmp = out + '.tmp'
+                    with tarfile.open(fileobj=io.BytesIO(payload)) as src, tarfile.open(tmp, 'w:gz') as dst:
+                        for m in src.getmembers():
+                            n = m.name[2:] if m.name.startswith('./') else m.name
+                            if not (n == 'opt/teamcity-agent-jdk21' or n.startswith('opt/teamcity-agent-jdk21/')):
+                                continue
+                            if not (m.isfile() or m.isdir()):
+                                sys.exit('неожиданный тип файла в JDK: ' + n)
+                            m.name = n; m.uid = m.gid = 0; m.uname = m.gname = 'root'
+                            dst.addfile(m, src.extractfile(m) if m.isfile() else None)
+                    os.chmod(tmp, 0o600); os.replace(tmp, out)
+                    print('built')
+                  - "{{ query('fileglob', agent_files ~ '/jdk/teamcity-agent-jdk21_*.deb') | first | default('') }}"
+                  - "{{ jdk_tarball }}"
+                creates: "{{ jdk_tarball }}"
+              delegate_to: localhost
+              throttle: 1
+
+            - name: "3e-2. Сумма архива JDK"
+              ansible.builtin.stat:
+                path: "{{ jdk_tarball }}"
+                checksum_algorithm: sha256
+              register: jdk_tarball_stat
+              delegate_to: localhost
+
+            - name: "3e-3. Архив JDK на агенте?"
+              ansible.builtin.raw: sha256sum {{ work_dir }}/teamcity-agent-jdk21.tar.gz 2>/dev/null | cut -d' ' -f1
+              register: jdk_remote_sum
+              changed_when: false
+
+            - name: "3e-4. Копирование архива JDK (scp)"
+              ansible.builtin.command:
+                argv: [scp, -q, -i, "{{ ssh_privkey_path }}", -o, BatchMode=yes, -o, StrictHostKeyChecking=accept-new,
+                       -P, "{{ ansible_port | default(22) }}", "{{ jdk_tarball }}",
+                       "root@{{ ansible_host | default(inventory_hostname) }}:{{ work_dir }}/teamcity-agent-jdk21.tar.gz"]
+              when: (jdk_remote_sum.stdout | trim) != jdk_tarball_stat.stat.checksum
+              delegate_to: localhost
+              changed_when: true
+              throttle: "{{ teamcity_agents_copy_parallel | default(3) | int }}"
+
+            - name: "3e-5. Распаковать в /opt/teamcity-agent-jdk21 (root, без записи для других)"
+              ansible.builtin.raw: |
+                set -e
+                [ -x /opt/teamcity-agent-jdk21/bin/java ] && { echo present; exit 0; }
+                [ -e /opt/teamcity-agent-jdk21 ] && { echo "/opt/teamcity-agent-jdk21 есть, но без bin/java — разберитесь вручную"; exit 1; }
+                tmp=$(mktemp -d /opt/.teamcity-agent-jdk21.XXXXXX)
+                tar -xzf {{ work_dir }}/teamcity-agent-jdk21.tar.gz -C "$tmp" --no-same-owner
+                j="$tmp/opt/teamcity-agent-jdk21"
+                [ -x "$j/bin/java" ] || { rm -rf "$tmp"; echo "в архиве нет opt/teamcity-agent-jdk21/bin/java"; exit 1; }
+                chown -R root:root "$j"; chmod -R go-w "$j"
+                "$j/bin/java" -version >/dev/null 2>&1 || { rm -rf "$tmp"; echo "java из архива не запускается"; exit 1; }
+                mv -T "$j" /opt/teamcity-agent-jdk21; rm -rf "$tmp"
+                echo installed
+              register: jdk_install
+              changed_when: "'installed' in jdk_install.stdout"
+
+        # Скрипты ищут автозапуск старого агента в /var/spool/cron/crontabs (Debian) и
+        # /etc/supervisor — на RPM-системах crontab пользователя и supervisord.d не видны,
+        # и старый агент вернулся бы после перезагрузки. Проверяем сами (строки нового агента — нет).
+        - name: "3f. RPM: автозапуск старого агента из crontab/supervisord"
+          ansible.builtin.raw: |
+            old={{ old_dir | quote }}; new={{ new_dir | quote }}
+            for f in /var/spool/cron/* /etc/supervisord.conf /etc/supervisord.d/*; do
+              [ -f "$f" ] || continue
+              grep -nEv '^[[:space:]]*[#;]' "$f" | grep -vF -e "$new/" |
+                awk -v o="$old/" 'index($0, o) || $0 ~ /(^|[^A-Za-z0-9_.-])agent[.]sh([^A-Za-z0-9_.-]|$)/' |
+                head -n 3 | cut -c1-160 | sed "s#^#AUTOSTART $f:#"
+            done
+            echo done
+          register: agent_rpm_autostart
+          changed_when: false
+          when:
+            - agent_sys.family == 'rpm'
+            - not (keep_old | bool)
+            - not (autostart_checked | bool)
+
+        - name: "3g. RPM: автозапуск старого агента не спрятан в crontab/supervisord"
+          ansible.builtin.assert:
+            that: found | length == 0
+            fail_msg: >-
+              {{ inventory_hostname }}: похоже, старый агент запускается отсюда: {{ found | join(' | ') }} —
+              скрипт переноса на RPM-системе этого не видит, и старый агент вернулся бы после перезагрузки.
+              Закомментируйте эти строки (crontab -u <пользователь> -e или файл supervisord) и запустите снова;
+              если это не автозапуск агента — -e teamcity_agent_rpm_autostart_checked=true для этого хоста. Ничего не изменено.
+            quiet: true
+          vars:
+            found: "{{ agent_rpm_autostart.stdout_lines | default([]) | select('match', '^AUTOSTART ') | map('regex_replace', '^AUTOSTART ', '') | list }}"
+          when: agent_rpm_autostart is not skipped
+
+        # --- 4. Проверка и перенос -------------------------------------------------
+        - name: "4. Новый агент рядом со старым (скрипт teamcity-agent-linux-migrate.sh)"
+          when: agent_mode == 'migrate'
+          vars:
+            # На RPM-системе скрипт не видит автозапуск из cron-обёртки и supervisord:
+            # «похоже, он запущен вручную» — старый агент вернулся бы после перезагрузки.
+            rpm_manual: >-
+              {{ agent_sys.family == 'rpm' and not (keep_old | bool) and not (autostart_checked | bool)
+                 and 'похоже, он запущен вручную' in (agent_check.stdout | default('')) }}
+          block:
+            - name: "4a. Проверка (--check): чего не хватает и план"
+              ansible.builtin.raw: cd {{ work_dir }} && bash ./teamcity-agent-linux-migrate.sh --check {{ script_args }}
+              register: agent_check
+              changed_when: false
+              failed_when: false
+
+            - name: "4b. Результат проверки"
+              ansible.builtin.debug:
+                msg: "{{ agent_check.stdout_lines }}"
+              when: agent_check.rc != 0 or (rpm_manual | bool) or (teamcity_agents_verbose | default(false) | bool)
+
+            - name: "4c. Проверка без блокирующих замечаний"
+              ansible.builtin.assert:
+                that:
+                  - agent_check.rc == 0
+                  - not (rpm_manual | bool)
+                fail_msg: >-
+                  {% if agent_check.rc != 0 %}{{ inventory_hostname }}: скрипт нашёл, что мешает переносу (пункты [НЕТ] выше), код {{ agent_check.rc }}.
+                  Ничего не изменено. Исправьте и запустите плейбук снова для этого агента.
+                  {% else %}{{ inventory_hostname }}: «{{ agent_check.stdout_lines | select('search', 'похоже, он запущен вручную') | first | default('') | trim }}» —
+                  на RPM-системе скрипт не видит автозапуск из cron-обёртки или supervisord, и старый агент вернулся бы после перезагрузки.
+                  Уберите этот автозапуск (crontab -u <пользователь> -e, /etc/supervisord.d) или, если агент запущен вручную,
+                  остановите его после сборки (agent.sh stop) и запустите снова. Ничего не изменено.
+                  Если проверили и автозапуска нет — -e teamcity_agent_rpm_autostart_checked=true для этого хоста.{% endif %}
+                quiet: true
+
+            - name: "4d. Перенос агента (ждёт окончания текущей сборки до {{ teamcity_agents_wait | default(600) }} с)"
+              ansible.builtin.raw: >-
+                cd {{ work_dir }} && log=migrate-$(date +%Y%m%d-%H%M%S).log &&
+                bash ./teamcity-agent-linux-migrate.sh --yes {{ script_args }} --wait {{ agent_wait }} > "$log" 2>&1;
+                rc=$?; chmod 600 "$log"; cat "$log"; echo "Журнал: {{ work_dir }}/$log"; exit $rc
+              register: agent_migrate
+              changed_when: "agent_migrate.rc == 0 and 'Ничего делать не нужно' not in agent_migrate.stdout"
+              failed_when: false
+              throttle: "{{ teamcity_agents_parallel | default(1) | int }}"
+
+            - name: "4e. Вывод скрипта переноса"
+              ansible.builtin.debug:
+                msg: "{{ agent_migrate.stdout_lines[-40:] }}"
+              when: agent_migrate.rc != 0 or (teamcity_agents_verbose | default(false) | bool)
+
+            - name: "4f. Перенос выполнен (код 3 — идёт сборка, ничего не прервано)"
+              ansible.builtin.assert:
+                that: agent_migrate.rc in [0, 3]
+                fail_msg: >-
+                  {{ inventory_hostname }}: перенос не удался (код {{ agent_migrate.rc }}). Скрипт вернул старого агента;
+                  подробности — вывод выше. Удалить нового агента: files/teamcity-agent/linux/teamcity-agent-linux-remove-new.sh.
+                quiet: true
+
+            # Код 0: скрипт сам дождался «Registered on server». Код 3: ничего не изменено.
+            - name: "4g. Код переноса"
+              ansible.builtin.set_fact:
+                agent_rc: "{{ agent_migrate.rc }}"
+                agent_new_ready: "{{ agent_migrate.rc == 0 }}"
+
+        # --- 4R. Перенаправление уже перенесённого агента -----------------------------
+        - name: "4R. Перенаправить нового агента на {{ server_url }}"
+          when: agent_mode == 'repoint'
+          block:
+            # RPM: тот же пробел, что в 4c, — до любых изменений.
+            - name: "4R-0. RPM: проверка выключения старого агента (--check)"
+              ansible.builtin.raw: >-
+                if [ -d {{ old_dir | quote }} ]; then cd {{ work_dir }} &&
+                bash ./teamcity-agent-linux-disable-old.sh --check {{ disable_args }}; else echo "Старого агента {{ old_dir }} нет"; fi
+              register: agent_disable_check
+              changed_when: false
+              failed_when: false
+              when:
+                - agent_sys.family == 'rpm'
+                - not (keep_old | bool)
+                - not (autostart_checked | bool)
+
+            - name: "4R-0. RPM: старый агент не запущен скрытым автозапуском"
+              ansible.builtin.assert:
+                that:
+                  - agent_disable_check.rc == 0
+                  - "'похоже, он запущен вручную' not in agent_disable_check.stdout"
+                fail_msg: >-
+                  {{ inventory_hostname }}: {% if agent_disable_check.rc != 0 %}проверка выключения старого агента: код {{ agent_disable_check.rc }}
+                  ({{ agent_disable_check.stdout_lines | select('search', '\\[НЕТ\\]') | list | join(' | ') | truncate(400) }}).
+                  {% else %}«{{ agent_disable_check.stdout_lines | select('search', 'похоже, он запущен вручную') | first | default('') | trim }}» —
+                  на RPM-системе скрипт не видит автозапуск из cron-обёртки или supervisord. Уберите его или остановите агента
+                  после сборки; если проверили — -e teamcity_agent_rpm_autostart_checked=true. {% endif %}Ничего не изменено.
+                quiet: true
+              when: agent_disable_check is not skipped
+
+            - name: "4R-1. Ждём, пока на новом агенте нет сборки (до {{ agent_wait }} с)"
+              ansible.builtin.raw: |
+                {{ busy_sh }}
+                t=0
+                while busy; do
+                  [ "$t" -ge {{ agent_wait }} ] && { echo BUSY; exit 0; }
+                  sleep 10; t=$((t + 10))
+                done
+                echo IDLE
+              register: agent_idle
+              changed_when: false
+
+            # Токен тестового сервера новому серверу не нужен: агент получит новый.
+            # Копия прежнего файла — buildAgent.properties.bak-repoint-* (права 600).
+            # Успех — только с «Registered on server» в журнале после перезапуска; иначе прежний
+            # файл возвращается (агент снова на прежнем сервере), старый агент 2018 не трогается.
+            - name: "4R-2. serverUrl, УЦ в conf/trustedCertificates, перезапуск, регистрация"
+              ansible.builtin.raw: |
+                set -e
+                {{ busy_sh }}
+                d={{ new_dir }}; f=$d/conf/buildAgent.properties; url={{ server_url | quote }}; log=$d/logs/teamcity-agent.log
+                # проверка ещё раз прямо перед изменением: сборка могла начаться, пока ждали других
+                if busy; then echo BUSY; exit 0; fi
+                systemctl enable {{ new_service }} >/dev/null 2>&1
+                u=$(stat -c %U "$d/conf"); g=$(stat -c %G "$d/conf")
+                b="$f.bak-repoint-$(date +%Y%m%d-%H%M%S)"
+                cp -p "$f" "$b" && chmod 600 "$b"
+                restore() {
+                  cp -p "$b" "$f"; chown "$u:$g" "$f"; chmod 600 "$f"
+                  systemctl restart {{ new_service }} || true
+                  echo "$(date '+%F %T') возвращён прежний файл: $b" >> {{ work_dir }}/repoint.log
+                  echo "$1 — возвращён прежний buildAgent.properties ($b), агент перезапущен с прежним сервером; старый агент 2018 не тронут"
+                  exit 1
+                }
+                sed -i -E "s#^[[:space:]]*serverUrl([[:space:]]*[=:]|[[:space:]]).*#serverUrl=$url#" "$f"
+                sed -i -E '/^[[:space:]]*authorizationToken[[:space:]]*[=:]/d' "$f"
+                echo "$(date '+%F %T') serverUrl -> $url, копия: $b" >> {{ work_dir }}/repoint.log; chmod 600 {{ work_dir }}/repoint.log
+                grep -qx "serverUrl=$url" "$f" || restore "serverUrl не записался"
+                chown "$u:$g" "$f" && chmod 600 "$f"
+                mkdir -p "$d/conf/trustedCertificates"
+                install -o "$u" -g "$g" -m 0644 {{ work_dir }}/elara-ca.crt "$d/conf/trustedCertificates/elara-ca.pem"
+                if [ -f {{ work_dir }}/teamcity-server.pem ]; then
+                  install -o "$u" -g "$g" -m 0644 {{ work_dir }}/teamcity-server.pem "$d/conf/trustedCertificates/teamcity-server.pem"
+                fi
+                chown "$u:$g" "$d/conf/trustedCertificates"
+                off=$(stat -c %s "$log" 2>/dev/null || echo 0)
+                systemctl restart {{ new_service }} || restore "служба {{ new_service }} не перезапустилась"
+                # Как в скрипте переноса: до 120 с, а если агент обновляется с сервера — до 10 мин.
+                left=120; longer=0; text=
+                while :; do
+                  size=$(stat -c %s "$log" 2>/dev/null || echo 0)
+                  if [ "$size" -lt "$off" ]; then text=$(LC_ALL=C tr -d '\000' < "$log" 2>/dev/null || true)
+                  else text=$(tail -c +$((off + 1)) "$log" 2>/dev/null | LC_ALL=C tr -d '\000'); fi
+                  if printf '%s\n' "$text" | LC_ALL=C grep -q 'Registered on server'; then echo REGISTERED; exit 0; fi
+                  if [ "$longer" = 0 ] && printf '%s\n' "$text" | LC_ALL=C grep -qi 'upgrad'; then longer=1; left=$((left + 480)); fi
+                  [ "$left" -le 0 ] && break
+                  sleep 3; left=$((left - 3))
+                done
+                # Последние записи о подключении (токены скрыты).
+                printf '%s\n' "$text" | LC_ALL=C grep -aE 'Registering on server|Error registering|PKIX|SSLHandshake|unauthorized|ERROR' | tail -n 5 |
+                  LC_ALL=C sed -E -e "s/(authorization token ')[^']*/\1***/g" -e 's/[0-9A-Fa-f]{32,}/***/g' | cut -c1-220 || true
+                restore "агент не зарегистрировался на $url"
+              register: agent_repoint
+              when: "'IDLE' in agent_idle.stdout"
+              throttle: "{{ teamcity_agents_parallel | default(1) | int }}"
+
+            - name: "4R-2. Новый агент на сервере"
+              ansible.builtin.set_fact:
+                agent_new_ready: "{{ 'REGISTERED' in (agent_repoint.stdout | default('')) }}"
+
+            # Старый агент 2018 (если переносили с --keep-old) — штатно, после сборки.
+            - name: "4R-3. Выключить старого агента (teamcity-agent-linux-disable-old.sh)"
+              ansible.builtin.raw: >-
+                if [ -d {{ old_dir | quote }} ]; then cd {{ work_dir }} && log=disable-old-$(date +%Y%m%d-%H%M%S).log &&
+                bash ./teamcity-agent-linux-disable-old.sh --yes {{ disable_args }} --wait {{ agent_wait }} > "$log" 2>&1;
+                rc=$?; chmod 600 "$log"; cat "$log"; echo "Журнал: {{ work_dir }}/$log"; exit $rc;
+                else echo "Старого агента {{ old_dir }} нет"; fi
+              register: agent_disable_old
+              changed_when: "agent_disable_old.rc == 0 and 'уже выключен' not in agent_disable_old.stdout and 'Старого агента' not in agent_disable_old.stdout"
+              failed_when: false
+              throttle: "{{ teamcity_agents_parallel | default(1) | int }}"
+              when:
+                - agent_new_ready | bool
+                - not (keep_old | bool)
+
+            - name: "4R-4. Вывод выключения старого агента"
+              ansible.builtin.debug:
+                msg: "{{ agent_disable_old.stdout_lines[-30:] }}"
+              when:
+                - agent_disable_old is not skipped
+                - agent_disable_old.rc | default(0) != 0 or (teamcity_agents_verbose | default(false) | bool)
+
+            - name: "4R-5. Старый агент выключен (код 3 — идёт сборка, ничего не прервано)"
+              ansible.builtin.assert:
+                that: agent_disable_old is skipped or agent_disable_old.rc in [0, 3]
+                fail_msg: >-
+                  {{ inventory_hostname }}: новый агент перенаправлен и зарегистрирован, но старого выключить не удалось
+                  (код {{ agent_disable_old.rc | default('?') }}), вывод выше.
+                quiet: true
+
+            - name: "4R-6. Код перенаправления"
+              ansible.builtin.set_fact:
+                agent_rc: >-
+                  {{ 3 if ('BUSY' in agent_idle.stdout or 'BUSY' in (agent_repoint.stdout | default(''))
+                           or (agent_disable_old.rc | default(0)) == 3) else 0 }}
+
+        # Сертификаты в conf/trustedCertificates — и у агентов, перенесённых раньше.
+        # Агент перечитывает их сам, перезапуск не нужен (связь уже идёт через УЦ).
+        - name: "4T. УЦ и сертификат сервера в conf/trustedCertificates нового агента"
+          ansible.builtin.raw: |
+            set -e
+            d={{ new_dir }}; [ -d "$d/conf" ] || { echo "нет $d/conf"; exit 0; }
+            u=$(stat -c %U "$d/conf"); g=$(stat -c %G "$d/conf"); t=$d/conf/trustedCertificates; ch=0
+            mkdir -p "$t"; chown "$u:$g" "$t"
+            for pair in elara-ca.crt:elara-ca.pem teamcity-server.pem:teamcity-server.pem; do
+              src={{ work_dir }}/${pair%%:*}; dst=$t/${pair##*:}
+              [ -f "$src" ] || continue
+              cmp -s "$src" "$dst" 2>/dev/null && continue
+              install -o "$u" -g "$g" -m 0644 "$src" "$dst"; ch=1
+            done
+            [ "$ch" = 1 ] && echo changed || echo same
+          register: agent_trusted
+          changed_when: "'changed' in agent_trusted.stdout"
+          when: agent_new_ready | bool
+
+        # --- 5. Имена для авторизации (сама авторизация — отдельным play на control node) ---
+        - name: "5a. Имена старого и нового агента"
+          ansible.builtin.raw: |
+            sed -n 's/^[[:space:]]*name[[:space:]]*[=:][[:space:]]*//p' {{ (old_dir ~ '/conf/buildAgent.properties') | quote }} 2>/dev/null | tail -n 1
+            echo '|'
+            sed -n 's/^[[:space:]]*name[[:space:]]*[=:][[:space:]]*//p' {{ new_dir }}/conf/buildAgent.properties 2>/dev/null | tail -n 1
+          register: agent_names
+          changed_when: false
+          when: agent_new_ready | bool
+
+        - name: "5b. Имена в факты"
+          ansible.builtin.set_fact:
+            agent_old_name: "{{ (agent_names.stdout.split('|')[0]) | trim }}"
+            agent_new_name: "{{ (agent_names.stdout.split('|')[1]) | trim }}"
+          when: agent_new_ready | bool
+
+        - name: "6. Итог по агенту"
+          ansible.builtin.set_fact:
+            agent_status: >-
+              {%- set what = 'перенаправлен на новый сервер' if agent_mode == 'repoint' else 'перенесён' -%}
+              {%- if not (agent_new_ready | bool) -%}ЖДЁТ СБОРКУ — ничего не изменено, запустите плейбук для него позже
+              {%- elif (agent_rc | int) == 3 -%}{{ what }}; старый агент ещё занят сборкой — запустите плейбук позже, чтобы выключить его
+              {%- elif keep_old | bool -%}{{ what }}, старый оставлен (keep_old)
+              {%- elif agent_mode == 'repoint' and 'Старого агента' in (agent_disable_old.stdout | default('')) -%}{{ what }}; старого агента {{ old_dir }} нет
+              {%- else -%}{{ what }}, старый выключен
+              {%- endif -%}
+      rescue:
+        - name: Ошибка на этом агенте — в итог (остальные агенты продолжают)
+          ansible.builtin.set_fact:
+            agent_rc: 1
+            agent_status: >-
+              {{ ('новый агент работает, авторизуется; ' if (agent_new_ready | default(false) | bool) else '')
+                 ~ 'ОШИБКА («' ~ (ansible_failed_task.name | default('?')) ~ '»): '
+                 ~ ((ansible_failed_result.msg | default('см. вывод выше', true)) | string | regex_replace('\\s+', ' ') | truncate(400))
+                 ~ ((' — ' ~ (ansible_failed_result.stdout_lines | default([]) | select | list)[-2:] | join(' | ')) | truncate(400)
+                    if (ansible_failed_result.stdout_lines | default([]) | select | list | length > 0) else '') }}
+
+- name: Authorize migrated Linux agents in TeamCity
+  ansible.builtin.import_playbook: tasks/agents-authorize-play.yml
+  vars:
+    agents_group: teamcity_agents_linux

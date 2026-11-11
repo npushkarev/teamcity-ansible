@@ -1,0 +1,108 @@
+---
+# Авторизация перенесённых агентов и их пулы — после переноса, на control node.
+# Подключается из 61/62: import_playbook с vars agents_group (группа агентов).
+# Play идёт по той же группе (проход на localhost при --limit пропускается),
+# а REST выполняется один раз — на первом оставшемся хосте, с delegate_to: localhost.
+# Авторизуется каждый агент, чей новый агент уже на сервере (agent_new_ready), даже если
+# старого выключить не удалось. В конце — итог и отказ для хостов с ошибкой
+# (в 60 отказ откладывается до самого конца: agents_defer_fail).
+
+- name: Authorize migrated agents in TeamCity
+  hosts: "{{ agents_group }}"
+  gather_facts: false
+  vars:
+    agents_first: "{{ inventory_hostname == ansible_play_hosts[0] }}"
+    # Агенты, которые обрабатывались в этом запуске (в том числе с ошибкой).
+    agents_attempted: >-
+      {{ groups[agents_group] | default([]) | map('extract', hostvars)
+         | selectattr('agent_attempted', 'defined') | map(attribute='inventory_hostname') | list }}
+    agents_ready: >-
+      {{ agents_attempted | map('extract', hostvars) | selectattr('agent_new_ready', 'defined')
+         | selectattr('agent_new_ready') | map(attribute='inventory_hostname') | list }}
+    agents_server_url: "{{ hostvars['localhost'].agents_server_url | default('') }}"
+    agents_ca_file: "{{ hostvars['localhost'].agents_ca_file | default('') }}"
+    agents_admin_token: "{{ vault_teamcity_admin_token | default('') }}"
+    agents_rest_headers:
+      Authorization: "Bearer {{ agents_admin_token }}"
+      Accept: application/json
+    # Репетиция (keep_old, копия рабочего сервера): новые агенты авторизуются, но выключаются.
+    agents_rehearsal: "{{ teamcity_agents_rehearsal | default(teamcity_agents_keep_old | default(false)) | bool }}"
+  tasks:
+    - name: Read inventory/vault.yml when present
+      ansible.builtin.include_vars:
+        file: "{{ inventory_dir }}/vault.yml"
+      when: query('fileglob', inventory_dir ~ '/vault.yml') | length > 0
+      no_log: true
+
+    # Один запрос до цикла: неверный токен или УЦ — сразу понятное сообщение,
+    # а не 3 минуты ожидания на каждом агенте.
+    - name: REST нового TeamCity с control node (токен и УЦ)
+      ansible.builtin.uri:
+        url: "{{ agents_server_url }}/app/rest/server"
+        headers: "{{ agents_rest_headers }}"
+        ca_path: "{{ agents_ca_file }}"
+      register: agents_rest_check
+      failed_when: false
+      delegate_to: localhost
+      no_log: true
+      when:
+        - agents_first | bool
+        - agents_server_url | length > 0
+        - agents_admin_token | length > 0
+        - agents_ready | length > 0
+
+    - name: REST недоступен
+      ansible.builtin.debug:
+        msg: >-
+          {{ agents_server_url }}/app/rest/server: HTTP {{ agents_rest_check.status | default('?') }}
+          ({{ agents_rest_check.msg | default('') | truncate(200) }}) — проверьте vault_teamcity_admin_token
+          (токен администратора ЭТОГО сервера) и УЦ; агенты не авторизованы.
+      when:
+        - agents_rest_check is not skipped
+        - (agents_rest_check.status | default(0)) != 200
+
+    - name: Authorize and pool each migrated agent
+      ansible.builtin.include_tasks: agent-authorize.yml
+      loop: "{{ agents_ready }}"
+      loop_control:
+        loop_var: agent_host
+      when:
+        - agents_first | bool
+        - hostvars[agent_host].agent_new_name | default('') | length > 0
+        - agents_rest_check is not skipped
+        - (agents_rest_check.status | default(0)) == 200
+
+    - name: Итог по агентам
+      ansible.builtin.set_fact:
+        agents_summary: "{{ agents_summary | default([]) + [line] }}"
+      loop: "{{ agents_attempted }}"
+      when: agents_first | bool
+      vars:
+        hv: "{{ hostvars[item] }}"
+        status: "{{ hv.agent_status | default('ОШИБКА — см. вывод выше по этому хосту') }}"
+        rest_result: "{{ (hostvars['localhost'].agent_rest_results | default({}))[item] | default({}) }}"
+        rest: >-
+          {%- if agents_admin_token | length == 0 -%}авторизуйте в TeamCity вручную (нет vault_teamcity_admin_token)
+          {%- elif (agents_rest_check.status | default(0)) != 200 -%}НЕ авторизован: REST HTTP {{ agents_rest_check.status | default('?') }} — см. выше
+          {%- else -%}{{ rest_result.text | default('НЕ авторизован — см. вывод выше') }}{%- endif -%}
+        line: "{{ item }}: {{ status }}{{ ('; ' ~ rest) if (hv.agent_new_ready | default(false) | bool) else '' }}"
+
+    - name: Итог переноса агентов
+      ansible.builtin.debug:
+        msg: "{{ agents_summary | default(['нет обработанных агентов']) }}"
+      when: agents_first | bool
+
+    - name: Агент перенесён и авторизован (ошибки — в итоге выше)
+      ansible.builtin.assert:
+        that:
+          - (agent_rc | default(-1) | int) in [0, 3]
+          - rest_ok | bool
+        fail_msg: "{{ inventory_hostname }}: {{ agent_status | default('ошибка') }}{{ '' if rest_ok | bool else '; новый агент не авторизован' }}"
+        quiet: true
+      when:
+        - agent_attempted | default(false) | bool
+        - not (agents_defer_fail | default(false) | bool)
+      vars:
+        rest_ok: >-
+          {{ not (agent_new_ready | default(false) | bool) or agents_admin_token | length == 0
+             or ((hostvars['localhost'].agent_rest_results | default({}))[inventory_hostname] | default({})).ok | default(false) | bool }}

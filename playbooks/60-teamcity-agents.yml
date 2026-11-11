@@ -1,0 +1,59 @@
+---
+# ===========================================================================
+# 60 — Перенос ВСЕХ агентов TeamCity на новый сервер (https):
+#   61 — Linux (группа teamcity_agents_linux, SSH; Debian/Ubuntu/Astra и ROSA),
+#   62 — Windows (группа teamcity_agents_windows, WinRM).
+#
+# Для каждого агента:
+#   - ещё не переносился — новый агент 2026 ставится рядом со старым (скрипты
+#     teamcity-agent-*-migrate);
+#   - уже перенесён на другой сервер (тестовый 172.17.6.61) — перенаправляется;
+#   - старый агент выключается только после того, как новый зарегистрировался на сервере,
+#     и после текущей сборки (кроме -e teamcity_agents_keep_old=true);
+#   - авторизация нового агента и пул старого (REST, vault_teamcity_admin_token).
+# Сам перенос — по одному агенту; сбой или недоступность одного агента не останавливает
+# остальных: ошибка попадает в итог, а хост помечается упавшим в самом конце.
+#
+# Проба на группе pilot (старые агенты продолжают работать; на копии сервера новые агенты
+# авторизуются, но выключаются, чтобы не пошли настоящие сборки):
+#   ansible-playbook playbooks/60-teamcity-agents.yml --limit pilot \
+#     --ask-pass --ask-vault-pass -e teamcity_agents_keep_old=true
+# Все агенты (в день переезда, после смены адреса сервера):
+#   ansible-playbook playbooks/60-teamcity-agents.yml --limit 'teamcity_agents_linux:teamcity_agents_windows' \
+#     --ask-pass --ask-vault-pass -e agents_confirm=yes
+# ===========================================================================
+
+- name: Linux agents
+  ansible.builtin.import_playbook: 61-teamcity-agents-linux.yml
+  vars:
+    agents_defer_fail: true
+
+- name: Windows agents
+  ansible.builtin.import_playbook: 62-teamcity-agents-windows.yml
+  vars:
+    agents_defer_fail: true
+
+# Отказ — только здесь, после обеих групп: иначе, если упали все Linux-агенты, Ansible
+# не стал бы обрабатывать Windows.
+- name: Result per agent
+  hosts: teamcity_agents_linux:teamcity_agents_windows
+  gather_facts: false
+  tasks:
+    - name: Read inventory/vault.yml when present
+      ansible.builtin.include_vars:
+        file: "{{ inventory_dir }}/vault.yml"
+      when: query('fileglob', inventory_dir ~ '/vault.yml') | length > 0
+      no_log: true
+
+    - name: Агент перенесён и авторизован (ошибки — в итогах выше)
+      ansible.builtin.assert:
+        that:
+          - (agent_rc | default(-1) | int) in [0, 3]
+          - rest_ok | bool
+        fail_msg: "{{ inventory_hostname }}: {{ agent_status | default('ошибка') }}{{ '' if rest_ok | bool else '; новый агент не авторизован' }}"
+        quiet: true
+      when: agent_attempted | default(false) | bool
+      vars:
+        rest_ok: >-
+          {{ not (agent_new_ready | default(false) | bool) or (vault_teamcity_admin_token | default('') | length == 0)
+             or ((hostvars['localhost'].agent_rest_results | default({}))[inventory_hostname] | default({})).ok | default(false) | bool }}

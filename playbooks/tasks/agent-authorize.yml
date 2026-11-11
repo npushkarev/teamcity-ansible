@@ -1,0 +1,193 @@
+---
+# Авторизация перенесённого агента и пул его старого агента (REST нового TeamCity).
+# Выполняется один раз на play (первый хост), REST — с control node (delegate_to: localhost).
+# Вход: agent_host — имя хоста из inventory; у него факты agent_old_name, agent_new_name.
+# Нужны: agents_server_url, agents_ca_file, agents_rest_headers, agents_rehearsal.
+# Результат: hostvars['localhost'].agent_rest_results[agent_host] = {text, ok} — для итога.
+# Во всех запросах — токен администратора: no_log всегда; при teamcity_agents_verbose
+# отдельной задачей печатаются только безопасные поля.
+
+- name: "{{ agent_host }}: новый агент подключился к серверу (до 3 минут)"
+  ansible.builtin.uri:
+    url: >-
+      {{ agents_server_url }}/app/rest/agents?locator={{ ('name:' ~ hostvars[agent_host].agent_new_name
+      ~ ',authorized:any,connected:any') | urlencode }}&fields=agent(id,name,authorized,connected,enabled,pool(id,name))
+    headers: "{{ agents_rest_headers }}"
+    ca_path: "{{ agents_ca_file }}"
+  register: agents_rest_new
+  until: >-
+    (agents_rest_new.json.agent | default([]) | selectattr('connected', 'defined') | selectattr('connected') | list | length) > 0
+    or (agents_rest_new.status | default(0)) in [401, 403, -1]
+  retries: 18
+  delay: 10
+  failed_when: false
+  delegate_to: localhost
+  no_log: true
+
+- name: "{{ agent_host }}: авторизация и пул"
+  when: (agents_rest_new.json.agent | default([]) | selectattr('connected', 'defined') | selectattr('connected') | list) | length > 0
+  vars:
+    agent_new: "{{ agents_rest_new.json.agent | selectattr('connected') | first }}"
+  block:
+    - name: "{{ agent_host }}: пул старого агента {{ hostvars[agent_host].agent_old_name }}"
+      ansible.builtin.uri:
+        url: >-
+          {{ agents_server_url }}/app/rest/agents?locator={{ ('name:' ~ hostvars[agent_host].agent_old_name
+          ~ ',authorized:any,connected:any') | urlencode }}&fields=agent(id,name,authorized,connected,pool(id,name))
+        headers: "{{ agents_rest_headers }}"
+        ca_path: "{{ agents_ca_file }}"
+      register: agents_rest_old
+      when: hostvars[agent_host].agent_old_name | default('') | length > 0
+      failed_when: false
+      delegate_to: localhost
+      no_log: true
+
+    # Старая запись (агент 2018) к новому серверу уже не подключится, но авторизованная
+    # занимает лицензию: снимаем авторизацию (пул уже прочитан выше). Неавторизованную
+    # отключённую запись сервер потом удаляет сам; история сборок остаётся.
+    - name: "{{ agent_host }}: освободить лицензию старой записи {{ hostvars[agent_host].agent_old_name }}"
+      ansible.builtin.uri:
+        url: "{{ agents_server_url }}/app/rest/agents/id:{{ old_agent.id }}/authorizedInfo"
+        method: PUT
+        headers: "{{ agents_rest_headers }}"
+        body_format: json
+        body:
+          status: false
+          comment:
+            text: "Replaced by {{ hostvars[agent_host].agent_new_name }} (ansible 60-teamcity-agents)"
+        ca_path: "{{ agents_ca_file }}"
+      vars:
+        old_agent: "{{ ((agents_rest_old | default({})).json | default({})).agent | default([]) | first | default({}) }}"
+      when:
+        - old_agent.id is defined
+        - old_agent.authorized | default(false) | bool
+        - not (old_agent.connected | default(false) | bool)
+        - old_agent.name | default('') != hostvars[agent_host].agent_new_name
+      register: agents_rest_unauth
+      changed_when: true
+      failed_when: false
+      delegate_to: localhost
+      no_log: true
+
+    - name: "{{ agent_host }}: авторизовать {{ hostvars[agent_host].agent_new_name }}"
+      ansible.builtin.uri:
+        url: "{{ agents_server_url }}/app/rest/agents/id:{{ agent_new.id }}/authorizedInfo"
+        method: PUT
+        headers: "{{ agents_rest_headers }}"
+        body_format: json
+        body:
+          status: true
+          comment:
+            text: "Migrated from {{ hostvars[agent_host].agent_old_name | default('?') }} by ansible (60-teamcity-agents)"
+        ca_path: "{{ agents_ca_file }}"
+      when: not (agent_new.authorized | default(false) | bool)
+      register: agents_rest_auth
+      changed_when: true
+      failed_when: false
+      delegate_to: localhost
+      no_log: true
+
+    - name: "{{ agent_host }}: в пул старого агента"
+      ansible.builtin.uri:
+        url: "{{ agents_server_url }}/app/rest/agentPools/id:{{ old_pool.id }}/agents"
+        method: POST
+        headers: "{{ agents_rest_headers }}"
+        body_format: json
+        body: "{{ {'id': agent_new.id | int} | to_json }}"
+        ca_path: "{{ agents_ca_file }}"
+      vars:
+        old_pool: "{{ ((agents_rest_old.json | default({})).agent | default([]) | first | default({})).pool | default({}) }}"
+      when:
+        - old_pool.id is defined
+        - old_pool.id | string != (agent_new.pool.id | default('') | string)
+      register: agents_rest_pool
+      changed_when: true
+      failed_when: false
+      delegate_to: localhost
+      no_log: true
+
+    # Репетиция (копия рабочего сервера): только что авторизованный агент выключается, чтобы
+    # на копии не пошли настоящие сборки (триггеры, очередь из backup, деплой). Включить для
+    # пробной сборки — Agents → агент → Enable. Уже авторизованного раньше не трогаем.
+    - name: "{{ agent_host }}: репетиция — выключить нового агента (сборки на копии сервера не пойдут)"
+      ansible.builtin.uri:
+        url: "{{ agents_server_url }}/app/rest/agents/id:{{ agent_new.id }}/enabledInfo"
+        method: PUT
+        headers: "{{ agents_rest_headers }}"
+        body_format: json
+        body:
+          status: false
+          comment:
+            text: "Rehearsal (ansible 60-teamcity-agents): enable manually for a test build"
+        ca_path: "{{ agents_ca_file }}"
+      when:
+        - agents_rehearsal | bool
+        - agents_rest_auth is not skipped
+        - (agents_rest_auth.status | default(0)) in [200, 204]
+        - agent_new.enabled | default(true) | bool
+      register: agents_rest_disable
+      changed_when: true
+      failed_when: false
+      delegate_to: localhost
+      no_log: true
+
+# Состояние после изменений: до авторизации у агента пул «<unknown>».
+- name: "{{ agent_host }}: состояние агента после изменений"
+  ansible.builtin.uri:
+    url: "{{ agents_server_url }}/app/rest/agents/id:{{ new_rec.id }}?fields=id,name,authorized,connected,enabled,pool(id,name)"
+    headers: "{{ agents_rest_headers }}"
+    ca_path: "{{ agents_ca_file }}"
+  vars:
+    new_rec: "{{ agents_rest_new.json.agent | default([]) | selectattr('connected', 'defined') | selectattr('connected') | list | first | default({}) }}"
+  when: new_rec.id is defined
+  register: agents_rest_final
+  failed_when: false
+  delegate_to: localhost
+  no_log: true
+
+- name: "{{ agent_host }}: ответы REST (безопасные поля)"
+  ansible.builtin.debug:
+    msg:
+      agent: "{{ agents_rest_new.json.agent | default([]) }}"
+      final: "{{ agents_rest_final.json | default({}) }}"
+      status: "{{ agents_rest_new.status | default('?') }}"
+      authorize: "{{ (agents_rest_auth | default({})).status | default('-') }}"
+      pool: "{{ (agents_rest_pool | default({})).status | default('-') }}"
+      unauthorize_old: "{{ (agents_rest_unauth | default({})).status | default('-') }}"
+      disable_rehearsal: "{{ (agents_rest_disable | default({})).status | default('-') }}"
+  when: teamcity_agents_verbose | default(false) | bool
+
+- name: "{{ agent_host }}: итог REST"
+  ansible.builtin.set_fact:
+    agent_rest_results: "{{ hostvars['localhost'].agent_rest_results | default({}) | combine({agent_host: {'text': text, 'ok': ok}}) }}"
+  delegate_to: localhost
+  delegate_facts: true
+  vars:
+    connected: "{{ (agents_rest_new.json.agent | default([]) | selectattr('connected', 'defined') | selectattr('connected') | list) | length > 0 }}"
+    new_status: "{{ agents_rest_new.status | default(0) }}"
+    auth_status: "{{ (agents_rest_auth | default({})).status | default(200) }}"
+    pool_status: "{{ (agents_rest_pool | default({})).status | default(200) }}"
+    auth_failed: "{{ agents_rest_auth is defined and agents_rest_auth is not skipped and (auth_status | int) not in [200, 204] }}"
+    pool_failed: "{{ agents_rest_pool is defined and agents_rest_pool is not skipped and (pool_status | int) not in [200, 204] }}"
+    disabled_now: "{{ agents_rest_disable is defined and agents_rest_disable is not skipped and (agents_rest_disable.status | default(0) | int) in [200, 204] }}"
+    new_rec: "{{ agents_rest_new.json.agent | default([]) | selectattr('connected', 'defined') | selectattr('connected') | list | first | default({}) }}"
+    final: >-
+      {{ agents_rest_final.json if (agents_rest_final is defined and agents_rest_final is not skipped
+         and (agents_rest_final.status | default(0)) == 200) else new_rec }}
+    old_agents: "{{ ((agents_rest_old | default({})).json | default({})).agent | default([]) }}"
+    old_name: "{{ hostvars[agent_host].agent_old_name | default('?', true) }}"
+    old_missing: "{{ hostvars[agent_host].agent_old_name | default('') | length > 0 and (old_agents | length) == 0 }}"
+    pool_name: "{{ (final.pool | default({})).name | default('?') }}"
+    pool_default: "{{ ((final.pool | default({})).id | default(0) | int) == 0 }}"
+    ok: "{{ (connected | bool) and not (auth_failed | bool) and not (pool_failed | bool) }}"
+    text: >-
+      {{ hostvars[agent_host].agent_new_name }}:
+      {%- if not (connected | bool) and (new_status | int) in [401, 403, -1] %} REST HTTP {{ new_status }} — проверьте vault_teamcity_admin_token (токен ЭТОГО сервера) и УЦ; авторизуйте вручную
+      {%- elif not (connected | bool) %} НЕ ПОДКЛЮЧИЛСЯ к серверу за 3 минуты — смотрите журнал агента
+      {%- elif auth_failed | bool %} подключён, но НЕ АВТОРИЗОВАН (HTTP {{ auth_status }}; лимит лицензии?) — Agents → Unauthorized
+      {%- else %} авторизован, пул {{ pool_name }}
+      {%- if (old_missing | bool) and (pool_default | bool) %} (записи старого агента {{ old_name }} на сервере нет — пул выберите вручную){% endif %}
+      {%- if pool_failed | bool %} (НЕ удалось поставить в пул: HTTP {{ pool_status }}){% endif %}
+      {%- if disabled_now | bool %}, ВЫКЛЮЧЕН — репетиция: для пробной сборки Agents → Enable
+      {%- elif not (final.enabled | default(true) | bool) %}, выключен (Agents → Enable){% endif %}
+      {%- endif %}

@@ -11,7 +11,9 @@
 | **`50-teamcity-migrate.yml`** | **всё остальное**: `40` + `53` + https на nginx + восстановление backup + обновление данных 2018 → 2026 + запуск |
 | `40-teamcity-backup-upload.yml` | (часть `50`) переносит backup и артефакты из `migration/` на ВМ: rsync, докачка, проверка SHA-256 |
 | `53-teamcity-proget.yml` | (часть `50`) Docker и Compose v2 из Debian, настройки Docker, образы из ProGet, `compose.yaml` |
-| `60-teamcity-agents-linux.yml` | Linux-агенты на новый сервер по https: агент 2026 рядом со старым (или перенаправление уже перенесённого), старый выключается после сборки, авторизация и пул |
+| **`60-teamcity-agents.yml`** | **все агенты** на новый сервер по https: `61` (Linux, SSH) + `62` (Windows, WinRM) |
+| `61-teamcity-agents-linux.yml` | (часть `60`) Linux: Debian 9–12, Ubuntu, Astra, ROSA |
+| `62-teamcity-agents-windows.yml` | (часть `60`) Windows Server / Windows 10–11 |
 
 Локальный build agent не создаётся: сборки выполняет внешний агент.
 
@@ -134,41 +136,38 @@ ansible-playbook playbooks/50-teamcity-migrate.yml --limit $H --ask-vault-pass
 
 **Чистая установка без переноса:** в `hosts.yml` поставьте `teamcity_start_containers: true` и удалите `teamcity_migration_staging_dir`, затем выполните только `53` и пройдите мастер настройки на `http://<IP>:8111` (для этого `teamcity_bind_address: 0.0.0.0`).
 
-## 7. Агенты (Linux)
+## 7. Агенты (все: Linux и Windows)
 
-Запускать **после** переключения адреса на новый сервер: старые агенты останавливаются (после текущей сборки) и перестают работать со старым сервером.
+Пошагово, с пробой на группе `pilot`, — в [MIGRATION.md](MIGRATION.md) (разделы 2.5, 4.11, 5–6).
 
-Что положить на control node:
+Что нужно на control node:
 
-- `files/teamcity-agent/jdk/` — пакеты Java 21 `teamcity-agent-jdk21_*_amd64.deb` (Debian 12+) и `..._~deb9_amd64.deb` (Debian 9–11, Ubuntu 22.04, Astra) из GitLab `root/teamcity` (см. `files/teamcity-agent/README.md`);
-- `files/ca/ca.crt` — корпоративный УЦ (уже есть после `00`);
-- в `vault.yml` — `vault_teamcity_admin_token`: токен администратора **нового** TeamCity (**Profile → Access Tokens**), чтобы плейбук сам авторизовал агентов и поставил их в пул старых;
-- в `hosts.yml` — группа `teamcity_agents_linux` с агентами (пример в `hosts.example.yml`).
+- пакеты: `sudo apt install -y ansible python3-winrm rsync` (`ansible` содержит `ansible.windows`);
+- `files/teamcity-agent/jdk/` — Java 21 из GitLab `root/teamcity` (не указатели LFS): `teamcity-agent-jdk21_*_amd64.deb`, `..._~deb9_amd64.deb`, `amazon-corretto-21*-windows-x64-jdk.zip` (см. `files/teamcity-agent/README.md`);
+- `files/ca/ca.crt` — корпоративный УЦ;
+- `vault.yml`: `vault_teamcity_admin_token` (токен администратора **нового** TeamCity), `vault_windows_admin_password` (WinRM);
+- `hosts.yml`: группы `teamcity_agents_linux`, `teamcity_agents_windows`, `pilot` (пример — `hosts.example.yml`).
 
 ```bash
-# первый агент, вход root по паролю (плейбук разложит SSH-ключ)
-ansible-playbook playbooks/60-teamcity-agents-linux.yml --limit ba-deb12-01.inc.elara.local \
-  --ask-pass --ask-vault-pass -e agents_confirm=yes
+# проба: 7 агентов, уже переведённых на тестовый сервер; старые агенты продолжают работать
+ansible-playbook playbooks/60-teamcity-agents.yml --limit pilot \
+  --ask-pass --ask-vault-pass -e teamcity_agents_keep_old=true
 
-# остальные — по одному, сами
-ansible-playbook playbooks/60-teamcity-agents-linux.yml --limit teamcity_agents_linux \
+# все агенты — в день переезда, после смены адреса сервера
+ansible-playbook playbooks/60-teamcity-agents.yml --limit 'teamcity_agents_linux:teamcity_agents_windows' \
   --ask-pass --ask-vault-pass -e agents_confirm=yes
 ```
 
-На каждом агенте плейбук:
+Для каждого агента:
 
-1. кладёт скрипт `teamcity-agent-linux-migrate.sh`, подходящий пакет Java (по версии libc6) и `buildAgentFull.zip` с нового сервера — с корпоративным УЦ в `conf/trustedCertificates` (агент сразу доверяет https; Java и системная Java не меняются);
-2. добавляет УЦ в систему агента (`update-ca-certificates`);
-3. запускает скрипт с `--check`, затем перенос: новый агент `/opt/buildAgent2026` (служба `teamcity-agent2026`), параметры старого переносятся, старый останавливается **после текущей сборки**, его автозапуск выключается. Папка старого агента не меняется; при сбое скрипт сам возвращает старого;
-4. авторизует нового агента (`<имя>-2026`) и ставит его в пул старого.
+1. **нового агента ещё нет** — ставится агент 2026 рядом со старым (Linux `/opt/buildAgent2026`, служба `teamcity-agent2026`; Windows `C:\BuildAgent2026`, служба `TCBuildAgent2026`) скриптами из GitLab (`files/teamcity-agent/{linux,windows}/`), с Java 21 и корпоративным УЦ в `conf/trustedCertificates` (агент сразу доверяет https; системная Java не меняется);
+2. **новый агент уже есть, но на другом сервере** (тестовый `172.17.6.61`) — перенаправляется: сертификаты, `serverUrl`, старый токен удаляется, перезапуск после текущей сборки;
+3. старый агент выключается — **только когда новый зарегистрировался** и после текущей сборки (кроме `-e teamcity_agents_keep_old=true`);
+4. новый агент авторизуется и ставится в пул старого (даже если старого выключить не удалось), а старая запись теряет авторизацию — освобождается лицензия, история сборок остаётся. На репетиции (`-e teamcity_agents_keep_old=true`, копия рабочего сервера) новый агент после авторизации выключается, чтобы на копии не пошли настоящие сборки.
 
-Если на агенте **уже стоит** агент 2026 от этих скриптов, но смотрит на другой сервер (например, тестовый `http://172.17.6.61:8111`), он не ставится заново, а **перенаправляется**: копия `buildAgent.properties`, новый `serverUrl`, старый токен удаляется (агент получит новый), УЦ в `conf/trustedCertificates`, перезапуск службы после текущей сборки; старый агент 2018 выключается скриптом `teamcity-agent-linux-disable-old.sh`. Журналы и команды возврата — на агенте в `/root/teamcity-agent-migrate/`.
+Проверки до любых изменений: система подходит скриптам (Linux: bash 4.4+, systemd 230+, glibc 2.17+; Windows: PowerShell 5.1, политика выполнения, место), имя сервера разрешается и https доступен **с этой машины**, есть Java. Проверки и копирование идут параллельно, сам перенос — по одному агенту; сбой или недоступность одного агента не останавливает остальных: причина — в итоге, хост помечается упавшим в самом конце. Если на агенте идёт сборка дольше 10 минут, он пропускается с пометкой «ЖДЁТ СБОРКУ». Python на Linux-агентах не нужен (подходит и Debian 9).
 
-Агенты переносятся по одному. Если на агенте сборка идёт дольше 10 минут, он пропускается с пометкой «ЖДЁТ СБОРКУ» — запустите плейбук для него позже. Python на агентах не нужен (подходит и Debian 9).
-
-Не переносятся этим плейбуком: `ba-rosa-01` (ROSA, не dpkg) и Windows-агенты — вручную, см. [MIGRATION.md](MIGRATION.md), разделы 5–6. Репетиция без остановки старых агентов: `-e teamcity_agents_keep_old=true` (новый агент работает рядом на порту 9091).
-
-Вернуть старого агента и удалить нового — команды печатает скрипт; подробно: `docs/teamcity-agent-linux-migrate.md`.
+Журналы и откат — на агентах: Linux `/root/teamcity-agent-migrate/`, Windows `C:\ProgramData\teamcity-agent-migrate\` (и `old-service.json`); подробно — `docs/teamcity-agent-linux-migrate.md`, [MIGRATION.md](MIGRATION.md) раздел 7.
 
 ## Расширение диска (01)
 

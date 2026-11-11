@@ -32,13 +32,82 @@ all:
         # (https://www.jetbrains.com/legal/docs/teamcity/license/). Принимать в браузере:
         # teamcity_accept_license_agreement: false
 
-    # Linux-агенты для 60-teamcity-agents-linux.yml (вход root; первый запуск с --ask-pass).
+    # ---------------------------------------------------------------------------
+    # Агенты (playbooks/60-teamcity-agents.yml = 61 Linux + 62 Windows).
     # Адрес сервера для агентов: https://<teamcity_public_name или имя ВМ TeamCity>;
-    # свой — teamcity_agents_server_url. Каталог старого агента не /opt/buildAgent —
-    # teamcity_agent_old_dir; старый агент работает от root — teamcity_agent_user: <пользователь>.
+    # свой — teamcity_agents_server_url (например, для репетиции).
+    # У хоста: teamcity_agent_old_dir — каталог старого агента, если не /opt/buildAgent
+    # (Linux) / не единственная служба агента (Windows); teamcity_agent_user — пользователь
+    # нового агента, если старый работает от root (Linux).
+
+    # Linux (SSH под root; первый запуск с --ask-pass). ROSA — тоже здесь (RPM).
     teamcity_agents_linux:
       hosts:
+        ba-deb-01.inc.elara.local:
+        ba-deb-02.inc.elara.local:
+        ba-deb-03.inc.elara.local:
+        ba-deb-04.inc.elara.local:
+        ba-deb-05.inc.elara.local:
+        ba-deb-06.inc.elara.local:
+        ba-deb-test.inc.elara.local:
         ba-deb12-01.inc.elara.local:
-        # ba-deb-01.inc.elara.local:
-        #   teamcity_agent_old_dir: /home/teamcity/buildAgent
+        ba-deb12-02.inc.elara.local:
+        ba-deb12-03.inc.elara.local:
+        ba-deb12-04.inc.elara.local:
+        ba-deb12-05.inc.elara.local:
+        ba-deb12-06.inc.elara.local:
+        ba-deb12-07.inc.elara.local:
+        ba-deb12-08.inc.elara.local:
+        ba-temp-deb12-nodejs.inc.elara.local:
+        ba-deb-pvs.inc.elara.local:
+        ba-ubu-01.inc.elara.local:
+        ba-tst-astra-01.inc.elara.local:
+        ba-rosa-01.inc.elara.local:
+      vars:
+        # Перенос ждёт сборку до 10 минут молча — без keepalive межсетевой экран может оборвать SSH.
+        ansible_ssh_common_args: -o ServerAliveInterval=30 -o ServerAliveCountMax=10
 
+    # Windows (WinRM). На control node: apt install ansible python3-winrm.
+    # Windows Server: WinRM включён по умолчанию; Windows 10/11: один раз Enable-PSRemoting -Force.
+    # Учётка — доменная, в локальных Administrators на агентах; пароль — в vault.yml.
+    teamcity_agents_windows:
+      hosts:
+        ba-win-01.inc.elara.local:
+        ba-win-02.inc.elara.local:
+        ba-win-03.inc.elara.local:
+        ba-win-04.inc.elara.local:
+        ba-win-05.inc.elara.local:
+        ba-win-06.inc.elara.local:
+        ba-win-10.inc.elara.local:
+        ba-w22-01.inc.elara.local:
+        ba-w22-02.inc.elara.local:
+        ba-w22-03.inc.elara.local:
+        ba-w22-04.inc.elara.local:
+        # Служба старого агента работает от пользователя (не LocalSystem) — нужен его пароль:
+        # ba-w22-02.inc.elara.local:
+        #   teamcity_agent_service_password: "{{ vault_agent_service_password }}"
+      vars:
+        ansible_connection: winrm
+        ansible_port: 5985
+        ansible_winrm_scheme: http
+        ansible_winrm_transport: ntlm            # или kerberos (ansible_user как user@INC.ELARA.LOCAL)
+        ansible_winrm_message_encryption: always # шифрование внутри WinRM по http
+        ansible_winrm_operation_timeout_sec: 100
+        ansible_winrm_read_timeout_sec: 120
+        ansible_win_async_startup_timeout: 30     # долгие шаги (установка, ожидание сборки) — async
+        ansible_user: 'INC\svc-ansible'          # доменная учётка; в одинарных кавычках
+        ansible_password: "{{ vault_windows_admin_password }}"
+
+    # Первые на перенос: 7 агентов, уже переведённых на тестовый 172.17.6.61.
+    # Проба без выключения старых агентов:
+    #   ansible-playbook playbooks/60-teamcity-agents.yml --limit pilot --ask-pass --ask-vault-pass \
+    #     -e teamcity_agents_keep_old=true
+    pilot:
+      hosts:
+        ba-deb-02.inc.elara.local:
+        ba-deb-06.inc.elara.local:
+        ba-deb-test.inc.elara.local:
+        ba-w22-01.inc.elara.local:
+        ba-w22-03.inc.elara.local:
+        ba-win-01.inc.elara.local:
+        ba-win-10.inc.elara.local:

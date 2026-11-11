@@ -1,0 +1,151 @@
+---
+# Подготовка на control node (общая для Linux- и Windows-агентов), один раз на play:
+#   - проверки (--limit, подтверждение), адрес сервера для агентов;
+#   - buildAgentFull.zip с НОВОГО сервера + корпоративный УЦ и сертификат сервера
+#     в conf/trustedCertificates (штатный способ TeamCity доверять серверу);
+#   - контрольные суммы файлов, которые раскладываются на агенты.
+# Вход (vars play): agent_files, agent_build, ca_file, tls_src_dir,
+#   agent_required_files — что обязано быть на control node,
+#   agent_payload_files  — что раскладывается на агенты (для сверки сумм).
+# Выход: hostvars['localhost'].agents_server_url, agent_src_sums (на хостах play).
+
+- name: Read inventory/vault.yml when present
+  ansible.builtin.include_vars:
+    file: "{{ inventory_dir }}/vault.yml"
+  when: query('fileglob', inventory_dir ~ '/vault.yml') | length > 0
+  no_log: true
+  run_once: true
+
+- name: Require --limit and explicit confirmation
+  ansible.builtin.assert:
+    that:
+      - ansible_limit is defined
+      - (agents_confirm | default('')) == 'yes' or (teamcity_agents_keep_old | default(false) | bool)
+    fail_msg: >-
+      Запускайте с --limit <агенты> и -e agents_confirm=yes: старые агенты будут остановлены
+      (после текущей сборки) и перестанут работать со старым сервером.
+      Репетиция без остановки старых агентов: -e teamcity_agents_keep_old=true.
+    quiet: true
+  run_once: true
+
+- name: Server URL for agents (teamcity_agents_server_url or https://<TeamCity VM>)
+  ansible.builtin.assert:
+    that: (teamcity_agents_server_url | default('') | length > 0) or (groups['teamcity'] | default([]) | length > 0)
+    fail_msg: Задайте teamcity_agents_server_url (например, https://teamcity.inc.elara.local) или группу teamcity в inventory.
+    quiet: true
+  run_once: true
+
+- name: Server URL for agents
+  ansible.builtin.set_fact:
+    agents_server_url: >-
+      {{ (teamcity_agents_server_url if (teamcity_agents_server_url | default('') | length > 0)
+          else 'https://' ~ (hostvars[groups['teamcity'][0]].teamcity_public_name | default(groups['teamcity'][0], true)))
+         | regex_replace('/+$', '') }}
+    # Абсолютный путь: в импортированных плейбуках playbook_dir другой.
+    agents_ca_file: "{{ ca_file | realpath }}"
+  run_once: true
+  delegate_to: localhost
+  delegate_facts: true
+
+- name: Files on control node
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ agent_required_files + [ca_file] }}"
+  register: agent_files_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Require scripts and corporate CA
+  ansible.builtin.assert:
+    that: agent_files_stat.results | rejectattr('stat.exists') | list | length == 0
+    fail_msg: >-
+      Не хватает на control node: {{ agent_files_stat.results | rejectattr('stat.exists') | map(attribute='item') | list }}
+      (корпоративный УЦ — files/ca/ca.crt; без него агенты не доверяют https сервера).
+    quiet: true
+  run_once: true
+
+- name: Build directory
+  ansible.builtin.file:
+    path: "{{ agent_build }}"
+    state: directory
+    mode: '0700'
+  delegate_to: localhost
+  run_once: true
+
+# Дистрибутив — с НОВОГО сервера: агент той же версии, что сервер.
+# Новая версия сервера — новый архив: -e teamcity_agents_redownload=true.
+- name: Download buildAgentFull.zip from the new server
+  ansible.builtin.uri:
+    url: "{{ hostvars['localhost'].agents_server_url }}/update/buildAgentFull.zip"
+    dest: "{{ agent_build }}/buildAgentFull.zip"
+    ca_path: "{{ ca_file }}"
+    mode: '0600'
+    creates: "{{ omit if (teamcity_agents_redownload | default(false) | bool) else agent_build ~ '/buildAgentFull.zip' }}"
+    timeout: 300
+  delegate_to: localhost
+  run_once: true
+
+# conf/trustedCertificates — штатный способ TeamCity доверять серверу с сертификатом
+# не от публичного УЦ («Uploading SSL Certificates»). Кладём УЦ и сертификат сервера;
+# их же — отдельными файлами в build/trusted/ (для агентов, перенесённых раньше).
+- name: Add corporate CA to the agent distribution (conf/trustedCertificates)
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import glob, os, ssl, sys, zipfile
+        src, dst, ca, tls_dir = sys.argv[1:5]
+        certs = {'conf/trustedCertificates/elara-ca.pem': open(ca, 'rb').read()}
+        for f in sorted(glob.glob(tls_dir + '/*.crt') + glob.glob(tls_dir + '/*.cer')
+                        + glob.glob(tls_dir + '/*.pem') + glob.glob(tls_dir + '/*.der'))[:1]:
+            data = open(f, 'rb').read()
+            if b'-----BEGIN CERTIFICATE-----' not in data:
+                data = ssl.DER_cert_to_PEM_cert(data).encode()
+            certs['conf/trustedCertificates/teamcity-server.pem'] = data
+        tdir = os.path.join(os.path.dirname(dst), 'trusted')
+        os.makedirs(tdir, exist_ok=True)
+        for n, d in certs.items():
+            with open(os.path.join(tdir, os.path.basename(n)), 'wb') as fh:
+                fh.write(d)
+        with zipfile.ZipFile(src) as zin:
+            names = zin.namelist()
+            if not any(n.startswith('BUILD_') or '/BUILD_' in n for n in names):
+                sys.exit('not a TeamCity agent distribution: ' + src)
+            # Уже собранный архив с теми же сертификатами не пересобираем.
+            if os.path.exists(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
+                with zipfile.ZipFile(dst) as zold:
+                    if all(n in zold.namelist() and zold.read(n) == d for n, d in certs.items()):
+                        print('same'); sys.exit(0)
+            tmp = dst + '.tmp'
+            with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+                for info in zin.infolist():
+                    if info.filename not in certs:
+                        zout.writestr(info, zin.read(info.filename))
+                for n, d in certs.items():
+                    zi = zipfile.ZipInfo(n, date_time=(2020, 1, 1, 0, 0, 0))
+                    zi.external_attr = 0o644 << 16
+                    zout.writestr(zi, d)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, dst)
+        print('changed')
+      - "{{ agent_build }}/buildAgentFull.zip"
+      - "{{ agent_build }}/buildAgentFull-https.zip"
+      - "{{ ca_file }}"
+      - "{{ tls_src_dir }}"
+  register: agent_zip
+  changed_when: "'changed' in agent_zip.stdout"
+  delegate_to: localhost
+  run_once: true
+
+- name: Checksums of files for agents
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+  loop: >-
+    {{ agent_payload_files + [agent_build ~ '/buildAgentFull-https.zip', ca_file]
+       + query('fileglob', agent_build ~ '/trusted/teamcity-server.pem') }}
+  register: agent_src_sums
+  delegate_to: localhost
+  run_once: true

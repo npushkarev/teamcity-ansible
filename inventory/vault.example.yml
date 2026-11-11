@@ -19,7 +19,12 @@ vault_teamcity_db_password: "CHANGE_ME_POSTGRES_PASSWORD"
 vault_proget_registry_user: "CHANGE_ME_PROGET_USER"
 vault_proget_registry_password: "CHANGE_ME_PROGET_PASSWORD"
 
-# 60-teamcity-agents-linux: токен администратора НОВОГО TeamCity (Profile → Access Tokens),
+# 60-teamcity-agents: токен администратора НОВОГО TeamCity (Profile → Access Tokens),
 # чтобы авторизовать перенесённых агентов и поставить их в пул старых. Пусто — вручную.
 vault_teamcity_admin_token: ""
+
+# 62 (Windows): пароль доменной учётки для WinRM (ansible_user группы teamcity_agents_windows).
+vault_windows_admin_password: "CHANGE_ME"
+# Пароль учётной записи службы старого агента, если она не LocalSystem (по хостам — в hosts.yml).
+# vault_agent_service_password: "CHANGE_ME"
 
