@@ -17,6 +17,9 @@ all:
         teamcity_registry_insecure: false
         # Наружу TeamCity виден только по https через nginx (50 ставит 127.0.0.1 сам).
         teamcity_bind_address: 127.0.0.1
+        # Адрес TeamCity для браузеров и агентов: https://<teamcity_public_name>.
+        # По умолчанию — имя ВМ (для репетиции). В день переезда (MIGRATION.md, шаг 4.6):
+        # teamcity_public_name: teamcity.inc.elara.local
         # Сборки выполняет внешний агент; 1 — поднять локальный minimal agent.
         teamcity_local_agent_count: 0
         # ПЕРЕНОС со старого TeamCity: 53 готовит Docker, образы и Compose, но НЕ запускает
