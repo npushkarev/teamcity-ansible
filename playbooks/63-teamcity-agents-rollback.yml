@@ -1,0 +1,250 @@
+---
+# ===========================================================================
+# 63 — Откат: вернуть нового агента (2026) на прежний сервер. Linux и Windows.
+#
+# Перенаправление (60/61/62, режим repoint) оставляет рядом прежний файл агента —
+# buildAgent.properties.bak-repoint-<время>, в нём прежний адрес и прежний токен.
+# 63 берёт самую позднюю такую копию, где serverUrl = teamcity_agents_rollback_url, и,
+# когда на агенте нет сборки, ставит её на место (служба остановлена — файл — запуск).
+# Агент возвращается на прежний сервер той же записью: авторизация и пул там сохранены.
+# Успех — только с «Registered on server» в журнале агента; иначе возвращается файл,
+# который был до отката (копия .bak-rollback-<время>). Старый агент 2018 не трогается.
+#
+# Пилот — вернуть агента с копии на тестовый сервер:
+#   ansible-playbook playbooks/63-teamcity-agents-rollback.yml --limit ba-w22-01.inc.elara.local \
+#     --ask-vault-pass -e teamcity_agents_rollback_url=http://172.17.6.61:8111
+# Linux-агенты — так же (ключ control node уже разложен 61; иначе добавьте --ask-pass).
+# ===========================================================================
+
+- name: Roll agents back to their previous server
+  hosts: teamcity_agents_linux:teamcity_agents_windows
+  gather_facts: false
+  vars:
+    rollback_url: "{{ (teamcity_agents_rollback_url | default('', true) | string | trim) | regex_replace('/+$', '') }}"
+    agent_wait: "{{ teamcity_agents_wait | default(600) | int }}"
+    is_windows: "{{ inventory_hostname in (groups['teamcity_agents_windows'] | default([])) }}"
+    # Linux
+    work_dir: /root/teamcity-agent-migrate
+    new_dir: /opt/buildAgent2026
+    new_service: teamcity-agent2026
+    # Windows (пути — текстом шаблона, см. 62)
+    win_work_dir: 'C:\ProgramData\teamcity-agent-migrate'
+    win_new_dir: 'C:\BuildAgent2026'
+    win_new_service: TCBuildAgent2026
+    win_helper: "{{ win_work_dir }}\\teamcity-agent-windows-ansible.ps1"
+    ps_file: [powershell.exe, -NoProfile, -NonInteractive, -ExecutionPolicy, Bypass, -File]
+    tcjson: "{{ '^TCJSON ' }}"
+    # Как в 61: сборка идёт, только если жив процесс агента и последняя метка — «Starting Build».
+    busy_sh: |
+      busy() {
+        _d={{ new_dir }}
+        _p=$(cat "$_d/logs/buildAgent.pid" 2>/dev/null) || _p=
+        case "$_p" in ''|*[!0-9]*) return 1 ;; esac
+        [ -e "/proc/$_p" ] && [ "$(readlink "/proc/$_p/cwd" 2>/dev/null)" = "$_d/bin" ] || return 1
+        for _log in "$_d/logs/teamcity-agent.log" "$_d/logs/teamcity-agent.log.1" "$_d/logs/teamcity-agent.log.2" "$_d/logs/teamcity-agent.log.3"; do
+          [ -f "$_log" ] && [ ! -L "$_log" ] || continue
+          _l=$(LC_ALL=C grep -aE ' - (Starting Build [{]id=[0-9]+|Build finished, build id [0-9]+|Build detached from agent, build id [0-9]+|Build agent started)' "$_log" 2>/dev/null | LC_ALL=C tr -d '\000' | tail -n 1)
+          [ -n "$_l" ] || continue
+          case "$_l" in *"Starting Build"*) return 0 ;; *) return 1 ;; esac
+        done
+        return 1
+      }
+  tasks:
+    - name: Запуск только с --limit и адресом, на который вернуть агентов
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - rollback_url is match('^https?://[^/]+$')
+        fail_msg: >-
+          Запуск: --limit <агенты> -e teamcity_agents_rollback_url=<адрес прежнего сервера>,
+          например http://172.17.6.61:8111. Сейчас: «{{ rollback_url }}».
+        quiet: true
+      run_once: true
+      delegate_to: localhost
+
+    - name: Агент обрабатывается в этом запуске
+      ansible.builtin.set_fact:
+        agent_attempted: true
+        agent_rc: -1
+
+    - name: Read inventory/vault.yml when present
+      ansible.builtin.include_vars:
+        file: "{{ inventory_dir }}/vault.yml"
+      when: query('fileglob', inventory_dir ~ '/vault.yml') | length > 0
+      no_log: true
+
+    - name: "Откат агента {{ inventory_hostname }}"
+      block:
+        # ---------------- Windows ----------------
+        - name: "W1. WinRM"
+          ansible.windows.win_ping:
+          register: rb_ping
+          ignore_unreachable: true
+          when: is_windows | bool
+
+        - name: "W1. WinRM доступен"
+          ansible.builtin.fail:
+            msg: "{{ inventory_hostname }}: НЕДОСТУПЕН по WinRM — {{ rb_ping.msg | default('') }}"
+          when:
+            - is_windows | bool
+            - rb_ping.unreachable | default(false) | bool
+
+        - name: "W2. Рабочий каталог 62 есть (без него перенаправления не было)"
+          ansible.windows.win_stat:
+            path: "{{ win_work_dir }}"
+          register: rb_work_dir
+          when: is_windows | bool
+
+        # Помощник новой версии (действие Rollback); каталог и его права создал 62.
+        - name: "W3. Помощник"
+          ansible.windows.win_copy:
+            src: "{{ playbook_dir }}/../files/teamcity-agent/windows/teamcity-agent-windows-ansible.ps1"
+            dest: "{{ win_helper }}"
+          when:
+            - is_windows | bool
+            - rb_work_dir.stat.exists | default(false)
+
+        - name: "W4. Вернуть прежний файл агента, перезапуск, регистрация (ждёт сборку до {{ agent_wait }} с)"
+          ansible.windows.win_command:
+            argv: "{{ ps_file + [win_helper, '-Action', 'Rollback', '-Dir', win_new_dir, '-NewService', win_new_service,
+                      '-ServerUrl', rollback_url, '-WaitSec', agent_wait | string] }}"
+          register: rb_win_raw
+          changed_when: "'\"result\":\"rolled back\"' in (rb_win_raw.stdout | default('', true))"
+          failed_when: false
+          async: "{{ agent_wait | int + 900 }}"
+          poll: 15
+          when:
+            - is_windows | bool
+            - rb_work_dir.stat.exists | default(false)
+
+        - name: "W5. Итог"
+          ansible.builtin.set_fact:
+            agent_rc: >-
+              {{ 0 if not (rb_work_dir.stat.exists | default(false)) else (rb_win_raw.rc | default(1)) }}
+            agent_status: >-
+              {%- set r = ((rb_win_raw.stdout_lines | default([]) | select('match', tcjson) | list | first | default('TCJSON {}'))[7:] | from_json) -%}
+              {%- if not (rb_work_dir.stat.exists | default(false)) -%}62 на этой машине не запускался — откатывать нечего
+              {%- elif r.result | default('') == 'rolled back' -%}возвращён на {{ rollback_url }} (зарегистрирован; копия {{ r.backup | default('') | win_basename }})
+              {%- elif r.result | default('') == 'already' -%}уже на {{ rollback_url }} — ничего не изменено
+              {%- elif r.result | default('') == 'nothing' -%}нового агента нет ({{ win_new_dir }}) — откатывать нечего
+              {%- elif (rb_win_raw.rc | default(1)) == 3 -%}ЖДЁТ СБОРКУ — ничего не изменено, запустите позже
+              {%- elif r.result | default('') == 'no backup' -%}ОШИБКА: нет копии buildAgent.properties.bak-repoint-* с адресом {{ rollback_url }} — откатывать нечем
+              {%- elif r.restored | default(false) -%}ОШИБКА: на {{ rollback_url }} агент не зарегистрировался{{ ' (ошибка сертификата)' if r.tls_error | default(false) else '' }} — возвращён файл до отката, агент снова на прежнем адресе
+              {%- else -%}ОШИБКА: {{ r.result | default(r.error | default(rb_win_raw.stdout | default('нет вывода') | truncate(300))) }}
+              {%- endif -%}
+          when: is_windows | bool
+
+        # ---------------- Linux ----------------
+        - name: "L1. Вход под root"
+          ansible.builtin.raw: id -u
+          register: rb_uid
+          changed_when: false
+          failed_when: false
+          ignore_unreachable: true
+          when: not (is_windows | bool)
+
+        - name: "L1. Вход удался, пользователь root"
+          ansible.builtin.fail:
+            msg: >-
+              {{ inventory_hostname }}:
+              {{ ('НЕДОСТУПЕН по SSH — ' ~ (rb_uid.msg | default(''))) if (rb_uid.unreachable | default(false) | bool)
+                 else ('вход не под root (id -u: ' ~ (rb_uid.stdout | default('') | trim) ~ ')') }}
+          when:
+            - not (is_windows | bool)
+            - (rb_uid.unreachable | default(false) | bool) or (rb_uid.rc | default(1)) != 0 or (rb_uid.stdout | default('') | trim) != '0'
+
+        - name: "L2. Вернуть прежний файл агента, перезапуск, регистрация (ждёт сборку до {{ agent_wait }} с)"
+          ansible.builtin.raw: |
+            set -e
+            {{ busy_sh }}
+            d={{ new_dir }}; f=$d/conf/buildAgent.properties; log=$d/logs/teamcity-agent.log
+            want=$(printf '%s' {{ rollback_url | quote }} | tr 'A-Z' 'a-z')
+            url_of() { sed -n 's/^[[:space:]]*serverUrl[[:space:]]*[=:][[:space:]]*//p' "$1" | tail -n 1 | tr -d '\r' | sed 's/\\\([:=]\)/\1/g; s#/*[[:space:]]*$##' | tr 'A-Z' 'a-z'; }
+            [ -f "$f" ] || { echo "NOTHING"; exit 0; }
+            if [ "$(url_of "$f")" = "$want" ]; then echo "ALREADY"; exit 0; fi
+            b=
+            for x in "$f".bak-repoint-*; do
+              [ -f "$x" ] || continue
+              if [ "$(url_of "$x")" = "$want" ]; then b=$x; fi
+            done
+            [ -n "$b" ] || { echo "NOBACKUP"; exit 1; }
+            t=0
+            while busy; do
+              if [ "$t" -ge {{ agent_wait }} ]; then echo BUSY; exit 0; fi
+              sleep 10; t=$((t + 10))
+            done
+            u=$(stat -c %U "$f"); g=$(stat -c %G "$f")
+            s="$f.bak-rollback-$(date +%Y%m%d-%H%M%S)"
+            cp -p "$f" "$s" && chmod 600 "$s"
+            off=$(stat -c %s "$log" 2>/dev/null || echo 0)
+            put() {
+              systemctl stop {{ new_service }} || true
+              cp -p "$1" "$f"; chown "$u:$g" "$f"; chmod 600 "$f"
+              systemctl enable {{ new_service }} >/dev/null 2>&1 || true
+              systemctl start {{ new_service }} || return 1
+            }
+            if ! put "$b"; then put "$s" || true; echo "служба {{ new_service }} не запустилась"; echo "RESTORED"; exit 1; fi
+            echo "$(date '+%F %T') откат: $b -> $f, файл до отката: $s" >> {{ work_dir }}/repoint.log 2>/dev/null || true
+            # Регистрация на прежнем сервере — как в 61: до 120 с, при обновлении агента до 10 мин.
+            left=120; longer=0; text=
+            while :; do
+              size=$(stat -c %s "$log" 2>/dev/null || echo 0)
+              if [ "$size" -lt "$off" ]; then text=$(LC_ALL=C tr -d '\000' < "$log" 2>/dev/null || true)
+              else text=$(tail -c +$((off + 1)) "$log" 2>/dev/null | LC_ALL=C tr -d '\000'); fi
+              if printf '%s\n' "$text" | LC_ALL=C grep -q 'Registered on server'; then echo "REGISTERED $(basename "$b")"; exit 0; fi
+              if [ "$longer" = 0 ] && printf '%s\n' "$text" | LC_ALL=C grep -qi 'upgrad'; then longer=1; left=$((left + 480)); fi
+              if [ "$left" -le 0 ]; then break; fi
+              sleep 3; left=$((left - 3))
+            done
+            printf '%s\n' "$text" | LC_ALL=C grep -aE 'Registering on server|Error registering|PKIX|SSLHandshake|unauthorized|ERROR' | tail -n 5 |
+              LC_ALL=C sed -E -e "s/(authorization token ')[^']*/\1***/g" -e 's/[0-9A-Fa-f]{32,}/***/g' | cut -c1-220 || true
+            put "$s"
+            echo "RESTORED"
+            exit 1
+          register: rb_linux
+          changed_when: "'REGISTERED' in (rb_linux.stdout | default(''))"
+          failed_when: false
+          when: not (is_windows | bool)
+
+        - name: "L3. Итог"
+          ansible.builtin.set_fact:
+            agent_rc: >-
+              {{ 3 if 'BUSY' in (rb_linux.stdout | default('')) else (rb_linux.rc | default(1)) }}
+            agent_status: >-
+              {%- set out = rb_linux.stdout | default('') -%}
+              {%- if 'REGISTERED' in out -%}возвращён на {{ rollback_url }} (зарегистрирован; копия {{ out | regex_findall('REGISTERED (\S+)') | first | default('?') }})
+              {%- elif 'ALREADY' in out -%}уже на {{ rollback_url }} — ничего не изменено
+              {%- elif 'NOTHING' in out -%}нового агента нет ({{ new_dir }}) — откатывать нечего
+              {%- elif 'BUSY' in out -%}ЖДЁТ СБОРКУ — ничего не изменено, запустите позже
+              {%- elif 'NOBACKUP' in out -%}ОШИБКА: нет копии buildAgent.properties.bak-repoint-* с адресом {{ rollback_url }} — откатывать нечем
+              {%- elif 'RESTORED' in out -%}ОШИБКА: на {{ rollback_url }} агент не зарегистрировался — возвращён файл до отката, агент снова на прежнем адресе; строки журнала: {{ rb_linux.stdout_lines | default([]) | reject('match', '^(RESTORED|$)') | list | join(' | ') | truncate(400) }}
+              {%- else -%}ОШИБКА: {{ (rb_linux.stdout | default('') ~ ' ' ~ (rb_linux.stderr | default(''))) | trim | truncate(300) }}
+              {%- endif -%}
+          when: not (is_windows | bool)
+      rescue:
+        - name: Ошибка на этом агенте — в итог (остальные агенты продолжают)
+          ansible.builtin.set_fact:
+            agent_rc: 1
+            agent_status: >-
+              {{ 'ОШИБКА («' ~ (ansible_failed_task.name | default('?')) ~ '»): '
+                 ~ ((ansible_failed_result.msg | default('см. вывод выше', true)) | string | regex_replace('\s+', ' ') | truncate(400)) }}
+
+- name: Rollback summary
+  hosts: teamcity_agents_linux:teamcity_agents_windows
+  gather_facts: false
+  tasks:
+    - name: Итог отката агентов
+      ansible.builtin.debug:
+        msg: >-
+          {{ ansible_play_hosts_all | map('extract', hostvars) | selectattr('agent_attempted', 'defined')
+             | map(attribute='inventory_hostname') | zip(ansible_play_hosts_all | map('extract', hostvars)
+             | selectattr('agent_attempted', 'defined') | map(attribute='agent_status', default='ОШИБКА — см. вывод выше'))
+             | map('join', ': ') | list }}
+      run_once: true
+
+    - name: Агент откатан (ошибки — в итоге выше)
+      ansible.builtin.assert:
+        that: (agent_rc | default(-1) | int) in [0, 3]
+        fail_msg: "{{ inventory_hostname }}: {{ agent_status | default('ошибка') }}"
+        quiet: true
+      when: agent_attempted | default(false) | bool

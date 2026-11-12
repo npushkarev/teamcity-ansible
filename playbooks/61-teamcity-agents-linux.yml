@@ -527,7 +527,7 @@
                   - "'похоже, он запущен вручную' not in agent_disable_check.stdout"
                 fail_msg: >-
                   {{ inventory_hostname }}: {% if agent_disable_check.rc != 0 %}проверка выключения старого агента: код {{ agent_disable_check.rc }}
-                  ({{ agent_disable_check.stdout_lines | select('search', '\\[НЕТ\\]') | list | join(' | ') | truncate(400) }}).
+                  ({{ agent_disable_check.stdout_lines | select('search', '\[НЕТ\]') | list | join(' | ') | truncate(400) }}).
                   {% else %}«{{ agent_disable_check.stdout_lines | select('search', 'похоже, он запущен вручную') | first | default('') | trim }}» —
                   на RPM-системе скрипт не видит автозапуск из cron-обёртки или supervisord. Уберите его или остановите агента
                   после сборки; если проверили — -e teamcity_agent_rpm_autostart_checked=true. {% endif %}Ничего не изменено.
@@ -692,7 +692,7 @@
             agent_status: >-
               {{ ('новый агент работает, авторизуется; ' if (agent_new_ready | default(false) | bool) else '')
                  ~ 'ОШИБКА («' ~ (ansible_failed_task.name | default('?')) ~ '»): '
-                 ~ ((ansible_failed_result.msg | default('см. вывод выше', true)) | string | regex_replace('\\s+', ' ') | truncate(400))
+                 ~ ((ansible_failed_result.msg | default('см. вывод выше', true)) | string | regex_replace('\s+', ' ') | truncate(400))
                  ~ ((' — ' ~ (ansible_failed_result.stdout_lines | default([]) | select | list)[-2:] | join(' | ')) | truncate(400)
                     if (ansible_failed_result.stdout_lines | default([]) | select | list | length > 0) else '') }}
 

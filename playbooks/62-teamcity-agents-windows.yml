@@ -448,7 +448,7 @@
                   ничего не удалено; проверьте {{ new_dir }} и журнал {{ agent_migrate_log }}, затем запустите снова.
                   {% elif agent_migrate.rc != 0 %}установка не удалась (код {{ agent_migrate.rc }}, журнал выше);
                   недоделанный агент удалён ({{ 'да' if (agent_remove_new.rc | default(1)) == 0 else 'НЕТ — смотрите вручную' }}), старый работает.
-                  {% else %}агент установлен, но не зарегистрировался за 5 минут{{ ' — ошибка сертификата (PKIX): проверьте conf\\trustedCertificates' if agent_install_tls | bool else '' }};
+                  {% else %}агент установлен, но не зарегистрировался за 5 минут{{ ' — ошибка сертификата (PKIX): проверьте conf\trustedCertificates' if agent_install_tls | bool else '' }};
                   старый агент НЕ выключен. Журнал: {{ new_dir }}\logs\teamcity-agent.log{% endif %}
                 quiet: true
 
@@ -657,7 +657,7 @@
             agent_status: >-
               {{ ('новый агент работает, авторизуется; ' if (agent_new_ready | default(false) | bool) else '')
                  ~ 'ОШИБКА («' ~ (ansible_failed_task.name | default('?')) ~ '»): '
-                 ~ ((ansible_failed_result.msg | default('см. вывод выше', true)) | string | regex_replace('\\s+', ' ') | truncate(400))
+                 ~ ((ansible_failed_result.msg | default('см. вывод выше', true)) | string | regex_replace('\s+', ' ') | truncate(400))
                  ~ ((' — ' ~ (ansible_failed_result.stdout_lines | default([]) | select | list)[-2:] | join(' | ')) | truncate(400)
                     if (ansible_failed_result.stdout_lines | default([]) | select | list | length > 0) else '') }}
 

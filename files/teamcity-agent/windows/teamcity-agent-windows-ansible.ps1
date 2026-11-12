@@ -13,6 +13,10 @@ Actions
             Exit 0 only with proof of registration on that server; already pointed there -
             the log must show registration since the agent started, else (idle) restart + wait
   Wait      wait for 'Registered on server' in the agent log written after -Offset
+  Rollback  return the new agent (-Dir) to -ServerUrl: newest buildAgent.properties.bak-repoint-*
+            with that serverUrl (previous token inside) is put back when no build runs; service
+            stop/start; exit 0 only after 'Registered on server', otherwise the file from before
+            the rollback is put back
   SaveOld   save the old agent service state (rollback source) to -Out
   OldOff    verify the old agent is off: services stopped+disabled, no JVM, no scheduled task,
             no HKLM Run entry
@@ -20,7 +24,7 @@ Pure functions (properties, log parsing) are dot-source safe for tests: -Action 
 #>
 [CmdletBinding()]
 param(
-  [ValidateSet('State', 'Probe', 'Idle', 'Repoint', 'Wait', 'SaveOld', 'OldOff', 'None')]
+  [ValidateSet('State', 'Probe', 'Idle', 'Repoint', 'Rollback', 'Wait', 'SaveOld', 'OldOff', 'None')]
   [string]$Action = 'None',
   [string]$Dir = 'C:\BuildAgent2026',
   [string]$OldDir = '',
@@ -81,6 +85,16 @@ function Set-ServerUrlLines([string[]]$lines, [string]$url) {
   }
   if (-not $done) { $out.Add("serverUrl=$url") }
   return , $out.ToArray()
+}
+
+function Find-RollbackBackup([string]$conf, [string]$url) {
+  # Newest (names end with yyyyMMdd-HHmmss) buildAgent.properties.bak-repoint-* whose serverUrl is $url.
+  $want = Format-Url $url
+  $found = $null
+  foreach ($b in @(Get-ChildItem -Path ($conf + '.bak-repoint-*') -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+    if ((Format-Url (Get-PropValue (Get-PropLines $b.FullName) 'serverUrl')) -ieq $want) { $found = $b.FullName }
+  }
+  return $found
 }
 
 # ---------------------------------------------------------------- logs
@@ -385,6 +399,60 @@ try {
         $res.restart = $(if ($res.registered -or $newJvm) { 'agent restarted itself' } else { 'no restart seen (agent busy or not detected)' })
       }
       Emit $res $(if ($res.registered) { 0 } else { 1 })
+    }
+    'Rollback' {
+      $url = Format-Url $ServerUrl
+      if (-not $url) { throw 'ServerUrl is empty' }
+      $conf = Join-Path $Dir 'conf\buildAgent.properties'
+      $log = Join-Path $Dir 'logs\teamcity-agent.log'
+      $res = [ordered]@{ result = ''; backup = ''; saved = ''; registered = $false; restored = $false; tls_error = $false }
+      if (-not (Test-Path -LiteralPath $conf)) { $res.result = 'nothing'; Emit $res 0 }
+      if ((Format-Url (Get-PropValue (Get-PropLines $conf) 'serverUrl')) -ieq $url) { $res.result = 'already'; Emit $res 0 }
+      $svc = Get-CimInstance Win32_Service -Filter "Name='$NewService'"
+      if (-not $svc) { $res.result = "service $NewService not found"; Emit $res 1 }
+      $bak = Find-RollbackBackup $conf $url
+      if (-not $bak) { $res.result = 'no backup'; Emit $res 1 }
+      $res.backup = $bak
+      $deadline = (Get-Date).AddSeconds($WaitSec)
+      while ($why = Test-Busy $Dir) {
+        if ((Get-Date) -ge $deadline) { $res.result = "busy: $why"; Emit $res 3 }
+        Start-Sleep -Seconds 15
+      }
+      if ($svc.StartMode -eq 'Disabled') { Set-Service -Name $NewService -StartupType Automatic }
+      $saved = $conf + '.bak-rollback-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+      Copy-Item -LiteralPath $conf -Destination $saved
+      $res.saved = $saved
+      $offset = Get-LogLength $Dir
+      # Stopped while the file is replaced: no self-restart of the agent in the middle.
+      try {
+        Stop-Service -Name $NewService -Force
+        Copy-Item -LiteralPath $bak -Destination $conf -Force
+        Start-Service -Name $NewService
+      } catch {
+        $err = [string]$_.Exception.Message
+        try { Stop-Service -Name $NewService -Force -ErrorAction SilentlyContinue } catch { }
+        Copy-Item -LiteralPath $saved -Destination $conf -Force
+        try { Start-Service -Name $NewService } catch { }
+        $res.restored = $true; $res.result = "service error: $err; file from before the rollback put back"
+        Emit $res 1
+      }
+      $t0 = Get-Date; $tlsSeen = $null
+      while ($true) {
+        $text = Read-LogFrom $log $offset
+        if ($text -cmatch $script:RegRe) { $res.registered = $true; break }
+        if ($text -match $script:TlsRe) {
+          $res.tls_error = $true
+          if (-not $tlsSeen) { $tlsSeen = Get-Date } elseif (((Get-Date) - $tlsSeen).TotalSeconds -ge 60) { break }
+        }
+        if (((Get-Date) - $t0).TotalSeconds -ge [math]::Max($WaitSec, 300)) { break }
+        Start-Sleep -Seconds 10
+      }
+      if ($res.registered) { $res.result = 'rolled back'; Emit $res 0 }
+      Stop-Service -Name $NewService -Force
+      Copy-Item -LiteralPath $saved -Destination $conf -Force
+      Start-Service -Name $NewService
+      $res.restored = $true; $res.result = 'not registered, file from before the rollback put back'
+      Emit $res 1
     }
     'Wait' {
       $log = Join-Path $Dir 'logs\teamcity-agent.log'
