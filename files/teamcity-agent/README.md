@@ -20,6 +20,14 @@ jdk/amazon-corretto-21.0.12.12.1-windows-x64-jdk.zip     ← Windows
 ```
 
 - Скачать из GitLab `root/teamcity` (`files/teamcity-agent-jdk21/debian12-amd64/`, `debian9-amd64/`, `windows-x64/`) кнопкой **Download** (не указатель LFS). Указатели LFS (около 134 байт) плейбук и скрипт не примут.
+- Пакет `~deb9` есть и в [релизе на GitHub](https://github.com/npushkarev/teamcity-ansible/releases/tag/jdk21-21.0.12.12.1). GitHub заменил в имени `~` на `.`, а плейбук ищет `~deb9` — сохраняйте под исходным именем:
+
+```bash
+cd files/teamcity-agent/jdk
+wget -O 'teamcity-agent-jdk21_21.0.12.12.1-1~deb9_amd64.deb' \
+  https://github.com/npushkarev/teamcity-ansible/releases/download/jdk21-21.0.12.12.1/teamcity-agent-jdk21_21.0.12.12.1-1.deb9_amd64.deb
+```
+
 - Проверка — `sha256sum files/teamcity-agent/jdk/*`:
 
 ```text
