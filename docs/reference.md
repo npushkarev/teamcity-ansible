@@ -90,8 +90,7 @@ read -rs P; printf '%s\n' "$P" > ~/.ansible/vault_pass_migration; unset P
 
 Swap возвращается файлом `/swapfile` на 2048 МиБ (`swapfile_size_mb`). Если ядро не перечитает таблицу разделов, ВМ перезагрузится автоматически. Отключить перезагрузку: `-e expand_root_reboot=false`. Повторный запуск безопасен: когда корень уже занимает 90 % диска и больше, плейбук ничего не делает.
 
-> [!WARNING]
-> У `01` нет проверки `--limit` (`hosts: all`): без `--limit` он пойдёт на все хосты inventory, включая Debian-агентов.
+`01` без `--limit` не запускается.
 
 ## 50: что происходит
 
@@ -310,7 +309,8 @@ Docker перезапускается только при изменении э�
 | рабочий каталог плейбука | `/root/teamcity-agent-migrate` (700) | `C:\ProgramData\teamcity-agent-migrate` (Administrators и SYSTEM) |
 | журналы переноса | `migrate-*.log`, `disable-old-*.log`, `repoint.log` | `migrate-*.log`, `disable-old-*.log` |
 | для отката старого агента | команды в конце журналов; копии crontab, cron-файлов и `rc.local` — `/var/backups/teamcity-agent-linux/`; выключенные строки помечены `#tcagent-off#` | `old-service.json` — имя и тип запуска старой службы (пишется, только когда `62` выключает старого); команда в конце `disable-old-*.log` |
-| копия настроек при перенаправлении | `conf/buildAgent.properties.bak-repoint-*` | `conf\buildAgent.properties.bak-repoint-*` |
+| копия настроек при перенаправлении (источник для `63`) | `conf/buildAgent.properties.bak-repoint-*` | `conf\buildAgent.properties.bak-repoint-*` |
+| копия настроек перед откатом `63` | `conf/buildAgent.properties.bak-rollback-*` | `conf\buildAgent.properties.bak-rollback-*` |
 | копия настроек при доработке агента | `conf/buildAgent.properties.bak-*` | — |
 | журнал агента | `/opt/buildAgent2026/logs/teamcity-agent.log` | `C:\BuildAgent2026\logs\teamcity-agent.log` |
 | УЦ | `conf/trustedCertificates/elara-ca.pem` и `teamcity-server.pem`; система: `/usr/local/share/ca-certificates/elara-teamcity-ca.crt` или `/etc/pki/ca-trust/source/anchors/elara-teamcity-ca.crt` | `conf\trustedCertificates\`; `LocalMachine\Root` |

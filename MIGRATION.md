@@ -57,7 +57,7 @@ flowchart LR
 Точка невозврата:
 
 - обновление данных 2018 → 2026 необратимо, но только на новой ВМ; старая ВМ не меняется — она и есть цель отката;
-- решать до 4.13: после открытия сборок откат теряет всё, что сделано на новом сервере (сборки, артефакты, изменения настроек);
+- решать до снятия паузы **Build Queue** в 4.13: после него сборки (и деплои) идут на новом сервере, откат теряет их, артефакты и изменения настроек;
 - старую ВМ держать отключённой 2–4 недели (раздел 5); после её удаления отката нет.
 
 ## 1. Подготовка
@@ -76,7 +76,18 @@ ls ~/.ssh/id_ed25519.pub || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
 
 `sshpass` нужен для `--ask-pass` (`00` и первый запуск `60` на Linux-агентах), `rsync` — для `40`/`50`, `python3-winrm` — для Windows-агентов. Пароль на ключ не ставить: `00` и `60` входят по ключу без запросов (BatchMode).
 
-- [ ] Проект: `git clone https://github.com/npushkarev/teamcity-ansible.git` или `git pull`. Проект из ZIP — `chmod -R go-w .`, иначе Ansible не прочитает `ansible.cfg`. В новую папку перенести `inventory/hosts.yml`, `inventory/vault.yml`, `migration/`, `files/tls/`, `files/ca/ca.crt`, `files/teamcity-agent/jdk/`.
+- [ ] Проект. Из git — `git clone https://github.com/npushkarev/teamcity-ansible.git`, обновление — `git pull`. Из ZIP (папка `teamcity-ansible-main`) — обновление заменой папки, свои файлы переносятся:
+
+```bash
+cd ~/teamcity && mv teamcity-ansible-main teamcity-ansible-old
+unzip -q ~/main.zip                       # https://github.com/npushkarev/teamcity-ansible/archive/refs/heads/main.zip
+cd teamcity-ansible-main && chmod -R go-w .   # иначе Ansible не прочитает ansible.cfg
+O=../teamcity-ansible-old
+cp $O/inventory/hosts.yml $O/inventory/vault.yml inventory/
+cp $O/files/ca/ca.crt files/ca/ && cp -r $O/files/tls/. files/tls/
+cp -r $O/files/teamcity-agent/jdk/. files/teamcity-agent/jdk/
+mv $O/migration/TeamCity_Backup.zip migration/; [ -d $O/migration/artifacts ] && mv $O/migration/artifacts migration/
+```
 - [ ] Сеть с control node: SSH (22) — новая ВМ, старый сервер, Linux-агенты; WinRM (5985) — Windows-агенты; https (443) — новый сервер (дистрибутив агента и REST).
 
 ### 1.2. Файлы
@@ -84,7 +95,7 @@ ls ~/.ssh/id_ed25519.pub || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
 - [ ] `files/ca/ca.crt` — корпоративный УЦ в PEM ([files/ca](files/ca/README.md)); `openssl x509 -in files/ca/ca.crt -noout -subject -enddate` показывает УЦ и срок.
 - [ ] `files/tls/` — ровно один сертификат `*.inc.elara.local` (`.cer`/`.crt`/`.pem`/`.der`, лучше с промежуточным УЦ) и один ключ `.key` ([files/tls](files/tls/README.md)).
 - [ ] **Образы в ProGet:** `library/teamcity-server` с тегом `2026.2-unlimited` и `library/postgres:16`. Если тег сервера другой — в `hosts.yml`: `teamcity_registry_server_image: proget.inc.elara.local/main/library/teamcity-server:<тег>`.
-- [ ] `files/teamcity-agent/jdk/` — Java 21 для агентов, к дню переезда; пилоту не нужна ([files/teamcity-agent](files/teamcity-agent/README.md)).
+- [ ] `files/teamcity-agent/jdk/` — Java 21 для агентов, к дню переезда; пилоту не нужна. Три файла из GitLab `root/teamcity` (`files/teamcity-agent-jdk21/`), кнопкой **Download**; проверка — `sha256sum files/teamcity-agent/jdk/*` ([files/teamcity-agent](files/teamcity-agent/README.md#java-21)).
 
 ### 1.3. Inventory и vault
 
@@ -130,12 +141,12 @@ H=deb-13-test-teamcity.inc.elara.local
 ansible-playbook playbooks/00-bootstrap-keys.yml --limit $H --ask-pass --ask-vault-pass
 ```
 
-Ожидаемо: в итоге `ключ ssh : работает`. Вывод называет следующим `53` — при переносе он входит в `50`, отдельно не нужен.
+Ожидаемо: в итоге `ключ ssh : работает`.
 
 **4.** Snapshot ВМ в vSphere, затем расширение корня.
 
 > [!WARNING]
-> `01` меняет таблицу разделов живого корня: удаляет swap и extended после корня, может перезагрузить ВМ. Только после snapshot и только с `--limit $H`: сам `01` `--limit` не проверяет и без него пойдёт на все хосты inventory, включая агентов.
+> `01` меняет таблицу разделов живого корня: удаляет swap и extended после корня, может перезагрузить ВМ. Только после snapshot и с `--limit $H` (без `--limit` `01` не запустится).
 
 ```bash
 ansible-playbook playbooks/01-expand-root.yml --limit $H -e expand_root_confirm=yes
@@ -160,7 +171,15 @@ df -h .                                             # место на control no
 - [ ] Сеть старого сервера записана (после 4.4 её не посмотреть); в vSphere у новой ВМ та же сеть (port group).
 - [ ] На старой ВМ нет других сервисов: после 4.4 они станут недоступны.
 - [ ] `arping` на новой ВМ: `ssh root@172.17.5.68 'apt-get install -y iputils-arping'`.
-- [ ] Как новая ВМ получает адрес: `ssh root@172.17.5.68 'ip -br a; grep -B1 -A4 "^iface" /etc/network/interfaces'`. `inet static` — адрес меняете сами (4.8). `inet dhcp` — с сетевыми админами заранее только договориться: резервирование `<СТАРЫЙ_IP>` на MAC новой ВМ переносится в окне, после 4.4, иначе ВМ возьмёт адрес, пока старый сервер в сети. Проще — в 4.8 перевести ВМ на `inet static`.
+- [ ] Как получают адрес обе ВМ (`inet static` или `inet dhcp`):
+
+```bash
+ssh root@172.17.5.68 'grep -B1 -A4 "^iface" /etc/network/interfaces'    # новая ВМ
+ssh $OLD 'grep -B1 -A4 "^iface" /etc/network/interfaces'                # старый сервер
+```
+
+  - `inet static` у новой ВМ — адрес меняете сами в 4.8. Рекомендуется: без участия DHCP.
+  - `inet dhcp` у старого сервера — резервирование `<СТАРЫЙ_IP>` остаётся за его MAC, пока он жив (иначе откат не получит адрес). Если новая ВМ всё же на DHCP — резервирование переносят в окне после 4.4 и возвращают при откате.
 
 ## 2. Репетиция сервера
 
@@ -192,7 +211,7 @@ ansible-playbook playbooks/50-teamcity-migrate.yml --limit $H --ask-vault-pass
 Ожидаемо: в конце `Готово` и `TeamCity: https://deb-13-test-teamcity.inc.elara.local`. Плейбук ждёт восстановления до 4 ч, обновления данных — до 1 ч. Ошибка — [Частые ошибки](#частые-ошибки) и журнал на ВМ `/opt/teamcity-2026/restore.log`.
 
 > [!WARNING]
-> Подсказку из `Готово` про агентов (`serverUrl` в `buildAgent.properties`, затем Authorize) не выполнять: рабочий агент 2018 уйдёт на копию, начнёт брать там настоящие сборки и обновится с сервера 2026 в своём каталоге. Агентов переносит только `60` (раздел 3).
+> Рабочих агентов 2018 на копию вручную не направлять: агент начнёт брать там настоящие сборки и обновится с сервера 2026 в своём каталоге. Агентов переносит только `60` (раздел 3).
 
 **2.4. Браузер: проверить копию и закрыть её от настоящей работы.**
 
@@ -200,13 +219,11 @@ ansible-playbook playbooks/50-teamcity-migrate.yml --limit $H --ask-vault-pass
 - [ ] вход старыми пользователями, проекты, история, артефакты на месте;
 - [ ] **Administration → Plugins**: внешние плагины старого сервера загружены;
 - [ ] **Administration → Global Settings**: Server URL = `https://deb-13-test-teamcity.inc.elara.local`;
-- [ ] **Build Queue** — удалить очередь, восстановленную из backup;
+- [ ] **Build Queue** — удалить очередь, восстановленную из backup, и **Pause**: сборки по триггерам встают в очередь, но не запускаются;
 - [ ] уведомления (**Email Notifier**) — выключить.
 
-Триггеры можно не выключать: агенты на копии выключены (раздел 3), сборки только встают в очередь.
-
 > [!WARNING]
-> В проектах с Versioned Settings на копии ничего не менять: изменения уйдут коммитом в репозиторий настроек рабочего сервера.
+> Триггеры и настройки проектов на копии не менять. В проектах с Versioned Settings изменение уйдёт коммитом в репозиторий настроек рабочего сервера. Если health report предлагает закоммитить настройки, преобразованные в формат 2026, — не нажимать (ни на копии, ни на новом сервере, пока жива старая ВМ): после отката 2018 прочитает формат 2026.
 
 **2.5. Записать время** backup (2.1), копирования (2.2) и `50` (2.3): по нему считается окно простоя (раздел 4, «Накануне»).
 
@@ -235,17 +252,12 @@ Linux `ba-deb-02`, `ba-deb-06`, `ba-deb-test`; Windows `ba-w22-01`, `ba-w22-03`,
 
 ### Раскатка
 
-**3.1. Control node готов.**
+**3.1. Control node готов** (1.1): свежий проект — в нём есть `playbooks/63-teamcity-agents-rollback.yml`.
 
 ```bash
-git pull
-ansible --version | head -1          # ansible [core 2.19.x]
-sudo apt install -y ansible python3-winrm sshpass rsync
-ls ~/.ssh/id_ed25519.pub || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+ls playbooks/62-teamcity-agents-windows.yml playbooks/63-teamcity-agents-rollback.yml
 ls -l files/ca/ca.crt files/tls/     # УЦ; один сертификат и один ключ
 ```
-
-Java (`files/teamcity-agent/jdk/`) для пилота не нужна: на 7 агентах Java 21 уже стоит. Она нужна в день переезда.
 
 **3.2. Inventory агентов.** В `inventory/hosts.yml` скопировать из `hosts.example.yml` группы `teamcity_agents_linux`, `teamcity_agents_windows` и `pilot`; вместо `INC\svc-ansible` — настоящая доменная учётка, в одинарных кавычках.
 
@@ -315,14 +327,41 @@ ba-deb-02.inc.elara.local: перенаправлен на новый серве
 - Linux: `пул Default` без подсказки — старый агент не в `/opt/buildAgent`: у хоста `teamcity_agent_old_dir`;
 - для разбора — фото блока `Итог переноса агентов` и первой красной строки `fatal:` или `ОШИБКА`; `vault.yml` и токены не фотографировать.
 
-**3.7. Проверка в копии.** **Agents**: 7 агентов `-2026` — Connected, авторизованы, Disabled (так задумано), пулы — как у старых агентов. Пробная сборка: очистить **Build Queue** → **Enable** одного агента → сборка без деплоя → снова **Disable**.
+**3.7. Проверка в копии.** **Agents**: 7 агентов `-2026` — Connected, авторизованы, Disabled (так задумано), пулы — как у старых агентов.
+
+Пробная сборка (по желанию), одна, без деплоя:
+
+1. **Build Queue**: очистить; очередь на паузе (2.4).
+2. **Agents** → агент → **Enable**.
+3. Конфигурация сборки → **Run** → **Agent**: этот агент; **Build Queue → Resume**.
+4. Как только сборка стартовала — **Build Queue → Pause**; после неё агент — **Disable**.
 
 > [!WARNING]
-> Включённый агент на копии берёт любую подходящую сборку из очереди, в том числе по триггерам. Повторный `60` включённого вручную агента не выключает.
+> Пока очередь не на паузе, включённый агент на копии берёт любую подходящую сборку, в том числе по триггерам. Повторный `60` включённого вручную агента не выключает.
 
 ### Откат
 
-**3.8. Вернуть агента на `172.17.6.61`** (агент Idle). Без отката в день переезда `60` сам перенаправит эти агенты с копии на финальный адрес; до тех пор `172.17.6.61` без них.
+**3.8. Вернуть агентов на `172.17.6.61`.** Без отката в день переезда `60` сам перенаправит эти агенты с копии на финальный адрес; до тех пор `172.17.6.61` без них.
+
+```bash
+ansible-playbook playbooks/63-teamcity-agents-rollback.yml --limit pilot --ask-vault-pass \
+  -e teamcity_agents_rollback_url=http://172.17.6.61:8111
+```
+
+`63` ставит на место самую позднюю копию `buildAgent.properties.bak-repoint-*` с адресом `172.17.6.61` (в ней прежний токен), когда на агенте нет сборки, перезапускает службу и ждёт `Registered on server`. Не зарегистрировался — возвращает файл, который был до отката. Ожидаемо, в `Итог отката агентов`:
+
+```text
+ba-w22-01.inc.elara.local: возвращён на http://172.17.6.61:8111 (зарегистрирован; копия buildAgent.properties.bak-repoint-…)
+```
+
+| В итоге | Что делать |
+|---|---|
+| `уже на …` | ничего: агент уже там |
+| `ЖДЁТ СБОРКУ` | повторить после сборки |
+| `нет копии … с адресом …` | этого агента с указанного адреса не перенаправляли — адрес в `-e` или агент не тот |
+| `не зарегистрировался … возвращён файл до отката` | сервер `172.17.6.61` недоступен с агента или запись агента там удалена |
+
+<details><summary>Вручную, без Ansible</summary>
 
 Linux, root на агенте:
 
@@ -344,14 +383,26 @@ Copy-Item -LiteralPath $b -Destination $f -Force; Restart-Service TCBuildAgent20
 
 Ожидаемо: `<имя>-2026` снова Connected на `http://172.17.6.61:8111` — в копии файла прежний токен, авторизация там сохранилась. На копии запись агента станет Disconnected. Остаются сертификаты в `conf/trustedCertificates`, ключ control node и УЦ в системе — работе не мешают. `buildAgent.properties` целиком не выводить: в нём токен агента.
 
+</details>
+
 ## 4. День переезда
 
 ### Накануне
 
 - [ ] **Окно простоя** = backup + копирование + `50` (время из 2.5) + смена IP + `60` для всех агентов + проверки + запас. `60` переносит агентов по одному; на агента: ожидание текущей сборки — до 10 мин, регистрация — до 2 мин (до 10 мин, если агент обновляется), авторизация — до 3 мин; у Windows ещё копирование ~600 МБ и регистрация до 5 мин. Пилот (только перенаправление) быстрее полной установки.
 
-> [!TIP]
-> Окно короче, если заранее поставить новых агентов на все машины так же, как пилот (`keep_old`, на копию): в окне `60` их только перенаправит. Параметры `system.*`/`env.*` старых агентов тогда переносятся в момент установки.
+<details><summary>Окно короче: новые агенты заранее (по желанию)</summary>
+
+Новые агенты ставятся на все машины рядом со старыми, на копию, старые не трогаются; в окне `60` их только перенаправит. Нужны Java в `files/teamcity-agent/jdk/` и пароли служб Windows (1.3). Параметры `system.*`/`env.*` старых агентов переносятся в момент установки — изменённые после неё в окне не перенесутся.
+
+```bash
+ansible-playbook playbooks/60-teamcity-agents.yml --limit 'teamcity_agents_linux:teamcity_agents_windows' \
+  --ask-pass --ask-vault-pass -e teamcity_agents_keep_old=true -e teamcity_agents_server_url=https://deb-13-test-teamcity.inc.elara.local
+```
+
+Откат — убрать новых агентов: `teamcity-agent-linux-remove-new.sh` / `teamcity-agent-windows-remove-new.ps1 -Yes` (на машине, из `files/teamcity-agent/`).
+
+</details>
 
 - [ ] Объявить окно.
 - [ ] Артефакты — заранее, в окне докачается разница (в `migration/` ещё архив репетиции — так и нужно, в окне он заменится):
@@ -371,7 +422,7 @@ ansible teamcity_agents_windows -m ansible.windows.win_ping -e @inventory/vault.
 for h in $(ansible 'teamcity_agents_linux:teamcity_agents_windows' --list-hosts | tail -n +2); do getent hosts $h >/dev/null && echo "ok $h" || echo "НЕТ DNS: $h"; done
 ```
 
-- [ ] Новый агент стоит только у `pilot`:
+- [ ] У кого уже стоит новый агент (`pilot` и, если делали, заранее поставленные):
 
 ```bash
 ansible teamcity_agents_linux -m raw -a "grep -H '^serverUrl' /opt/buildAgent2026/conf/buildAgent.properties 2>/dev/null || echo NONE" --ask-pass
@@ -408,7 +459,7 @@ scp $OLD:/data/teamcity-data/backup/<имя>.zip migration/TeamCity_Backup.zip  
 rsync -a --partial $OLD:/data/teamcity-data/system/artifacts/ migration/artifacts/
 ```
 
-**4.4. vSphere: отключить старый сервер от сети.** **Edit Settings** → сетевой адаптер → снять **Connected**. ВМ не выключать: она — точка отката. DHCP: сетевые админы переносят резервирование сейчас.
+**4.4. vSphere: отключить старый сервер от сети.** **Edit Settings** → сетевой адаптер → снять **Connected** и **Connect At Power On** (иначе после перезапуска ВМ, в том числе HA, адаптер подключится сам). ВМ не выключать: она — точка отката.
 
 **4.5. Удалить данные репетиции на новой ВМ.**
 
@@ -498,26 +549,31 @@ ansible-playbook playbooks/60-teamcity-agents.yml --limit ba-deb-01.inc.elara.lo
 | `старый агент ещё занят сборкой — запустите плейбук позже` | новый агент работает и авторизован, старый ещё включён | после сборки — повтор |
 | `ОШИБКА («<шаг>»)`, `НЕДОСТУПЕН по SSH`, `НЕДОСТУПЕН по WinRM` | причина — в строке | [Частые ошибки](#частые-ошибки), затем повтор |
 | `НЕ ПОДКЛЮЧИЛСЯ`, `НЕ АВТОРИЗОВАН`, `вручную` | агент переключён, авторизация или пул не сделаны | [Частые ошибки](#частые-ошибки) |
+| `старого агента … нет`, `старый агент не найден` | новый агент работает, старый не найден | у хоста `teamcity_agent_old_dir` и повтор; старого агента на машине нет — так и оставить |
 
 Переменную для одного хоста (`teamcity_agent_old_dir`, `teamcity_agent_old_autostart_checked` и другие) задавать у него в `hosts.yml`: `-e` действует на все хосты запуска.
 
 **4.13. Новый TeamCity: проверка и открытие сборок.**
 
 - [ ] **Agents**: все агенты `-2026` Connected, авторизованы, в своих пулах;
-- [ ] **Build Queue** — снять паузу;
-- [ ] пробная сборка на Linux и на Windows;
-- [ ] объявить конец работ.
+- [ ] пробная сборка на Linux и на Windows — как в 3.7 (Run на выбранном агенте, Resume, после старта — Pause);
+- [ ] решение: работаем или откат.
 
-> [!NOTE]
-> После 4.13 откат теряет всё, что сделано на новом сервере ([Когда откатываться](#когда-откатываться)).
+> [!WARNING]
+> Дальше — точка невозврата: после снятия паузы идут все сборки, в том числе деплои; откат их теряет вместе с артефактами и изменениями настроек.
+
+- [ ] **Build Queue** — снять паузу;
+- [ ] объявить конец работ.
 
 ### Откат: сервер
 
-В любой момент, пока старая ВМ есть.
+В любой момент, пока старая ВМ есть. Если идёт `60` — не прерывать (Ctrl+C), дождаться `Итог`: по нему видно, какие агенты переключены (откат агентов — ниже).
 
-**1.** vSphere: у новой ВМ снять **Connected**, у старого сервера — поставить.
+**1.** vSphere: у новой ВМ снять **Connected** и **Connect At Power On**, у старого сервера — поставить оба. Новая ВМ на DHCP — сетевые админы возвращают резервирование `<СТАРЫЙ_IP>` на MAC старого сервера.
 
-**2.** Проверка с control node:
+**2.** Backup в 4.2 делали без UI (TeamCity на старом сервере остановлен, [запасной вариант](docs/reference.md#backup-без-ui-запасной-вариант)) — в консоли старой ВМ запустить TeamCity.
+
+**3.** Проверка с control node:
 
 ```bash
 curl -sI http://teamcity.inc.elara.local/ | head -1   # ответ старого сервера, не «308 Permanent Redirect»
@@ -525,17 +581,17 @@ curl -sI http://teamcity.inc.elara.local/ | head -1   # ответ старог�
 
 Всё ещё `308` или нет ответа пару минут — на старом сервере (консоль vSphere) `arping -U -c 3 -I <интерфейс> <СТАРЫЙ_IP>` или перезапуск сети.
 
-**3.** Старый TeamCity: снять паузу **Build Queue**; если в 4.1 выключали агентов — включить.
+**4.** Старый TeamCity (браузер, приватное окно: браузеры запоминают 308 на https, а у старого сервера только http): снять паузу **Build Queue**; если в 4.1 выключали агентов — включить. Пользователям: открывать `http://`, при ошибке — очистить кеш браузера.
 
-**4.** Если 4.11 уже был — откат агентов (ниже).
+**5.** Если 4.11 уже был — откат агентов (ниже).
 
 Возвращаемся к старому TeamCity 2018 с данными на момент 4.1: на нём ничего не менялось, записи агентов тоже. Новая ВМ с данными 2026 остаётся без сети — для разбора. Теряется всё, что сделано на новом сервере.
 
-Повторная попытка: в консоли новой ВМ вернуть `172.17.5.68` (`/etc/network/interfaces`, `systemctl restart networking`), только потом **Connected**; в `hosts.yml` — `ansible_host: 172.17.5.68`; дальше — с 4.1 (4.5 удалит данные прошлой попытки).
+Повторная попытка: в консоли новой ВМ остановить TeamCity (`cd /opt/teamcity-2026 && docker compose stop` — иначе в сети второй рабочий сервер: письма, опрос VCS), вернуть `172.17.5.68` (`/etc/network/interfaces`, `systemctl restart networking`), только потом **Connected** и **Connect At Power On**; в `hosts.yml` — `ansible_host: 172.17.5.68`; дальше — с 4.1 (4.5 удалит данные прошлой попытки).
 
 ### Откат: Linux-агенты
 
-Плейбука отката нет: команды — на каждом агенте, их печатают скрипты в журналы `/root/teamcity-agent-migrate/`.
+Вернуть старого агента 2018 плейбуком нельзя (`63` — только для перенаправленных агентов, раздел 3.8): команды — на каждом агенте, их печатают скрипты в журналы `/root/teamcity-agent-migrate/`.
 
 ```bash
 # control node: последние журналы всех Linux-агентов
@@ -563,14 +619,14 @@ Set-Service TCBuildAgent2026 -StartupType Disabled; Stop-Service TCBuildAgent202
 Set-Service <name> -StartupType Automatic; Start-Service <name>    # name из old-service.json; start_mode Manual — -StartupType Manual
 ```
 
-Готовая строка — в конце последнего `C:\ProgramData\teamcity-agent-migrate\disable-old-*.log` (`Включить старого агента обратно: …`). Возвращается старый агент, как до 4.11. Остаются `C:\BuildAgent2026` (служба выключена) и УЦ в `LocalMachine\Root`.
+Та же строка (`Включить старого агента обратно: …`) — в конце первого `C:\ProgramData\teamcity-agent-migrate\disable-old-*.log`, где старый агент действительно выключался (повторные запуски её не пишут). Возвращается старый агент, как до 4.11. Остаются `C:\BuildAgent2026` (служба выключена) и УЦ в `LocalMachine\Root`.
 
 ## 5. После переезда
 
 ### Раскатка
 
-- [ ] Ссылки `http://teamcity.inc.elara.local/...` работают (перенаправление 308). Webhooks в Bitbucket со временем перевести на `https://`.
-- [ ] У всех агентов в итоге `старый выключен` (повтор 4.12). Linux-хосты, где новый агент стоял заранее («Накануне»), — ещё раз `60`.
+- [ ] Ссылки `http://teamcity.inc.elara.local/...` работают (перенаправление 308). Webhooks в Bitbucket перевести на `https://` — после удаления старой ВМ (у неё только http).
+- [ ] У всех агентов в итоге `старый выключен` или проверено, что старого нет (4.12). Linux-хосты, где новый агент стоял заранее («Накануне»), — ещё раз `60`.
 - [ ] Тестовый сервер `172.17.6.61` агентам больше не нужен.
 - [ ] Когда `60` больше не нужен: токен из 4.10 удалить (**Profile → Access Tokens**), в vault `vault_teamcity_admin_token: ""`.
 - [ ] Копии backup — в них пароли и токены — удалить:
@@ -582,6 +638,7 @@ rm -rf migration/TeamCity_Backup.zip migration/artifacts    # control node
 
 Повторный `50` после этого (например, новый сертификат в `files/tls/`) требует снова положить `migration/TeamCity_Backup.zip`: `40` проверяет архив. Восстановление не повторится: есть метка `/opt/teamcity-2026/.restored`.
 
+- [ ] Пока есть старая ВМ, не удалять и не менять: каталоги и службы старых агентов (`/opt/buildAgent`, `C:\BuildAgent`), журналы и копии для отката (`/root/teamcity-agent-migrate/`, `/var/backups/teamcity-agent-linux/`, `C:\ProgramData\teamcity-agent-migrate\old-service.json`), адрес и DHCP-резервирование старого сервера.
 - [ ] Через 2–4 недели: backup нового сервера (**Administration → Backup**), затем удалить старую ВМ.
 
 ### Откат
@@ -645,7 +702,7 @@ rm -rf migration/TeamCity_Backup.zip migration/artifacts    # control node
 | `новый агент не зарегистрировался на … — старый агент НЕ выключен` (Windows) | прежний файл сам не возвращается (копия `…bak-repoint-*`); журнал `C:\BuildAgent2026\logs\teamcity-agent.log`; исправить и повторить |
 | `агент установлен, но не зарегистрировался за 5 минут` (Windows; `PKIX` — сертификаты) | `conf\trustedCertificates` и журнал агента; новый агент остаётся, повтор возьмёт его; убрать — `teamcity-agent-windows-remove-new.ps1 -Yes` |
 | `по журналу зарегистрировался, но сервер не видит его подключённым` (Windows) | **Agents** и журнал агента, затем повтор; старый агент не выключен |
-| `старого выключить не удалось` | вывод `disable-old` выше и журнал `disable-old-*.log`; новый агент работает; повтор |
+| `старого выключить не удалось` | вывод `disable-old` выше и журнал `disable-old-*.log`; новый агент работает и авторизован; исправить и повторить |
 | `недоступен (TrustFailure / SecureChannelFailure / NameResolutionFailure)` (Windows) | нет УЦ / TLS / DNS на машине — см. сообщение; затем повтор |
 | `нужен пароль: teamcity_agent_service_password` (Windows) | пароль учётки службы в vault и у хоста (1.3) |
 | `служб агентов N` … `задайте teamcity_agent_old_dir` (Windows) | `teamcity_agent_old_dir` у хоста |

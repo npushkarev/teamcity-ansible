@@ -434,7 +434,7 @@
           -- дальше:
             snapshot ВМ, затем (если диск увеличен в vSphere):
             ansible-playbook playbooks/01-expand-root.yml --limit {{ inventory_hostname }} -e expand_root_confirm=yes
-            ansible-playbook playbooks/53-teamcity-proget.yml --limit {{ inventory_hostname }} --ask-vault-pass
+            ansible-playbook playbooks/50-teamcity-migrate.yml --limit {{ inventory_hostname }} --ask-vault-pass
 
     - name: "10d. СТОП: вход по ключу не работает"
       ansible.builtin.fail:

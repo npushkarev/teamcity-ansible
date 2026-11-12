@@ -45,6 +45,12 @@
 
   tasks:
     # --- 0. Guard'ы ---------------------------------------------------------
+    - name: 0-pre. Только с --limit (иначе пойдёт на все хосты inventory, включая агентов)
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Запускайте с --limit <ВМ>, например: --limit deb-13-test-teamcity.inc.elara.local"
+        quiet: true
+
     - name: 0a. Требуется явное подтверждение (был ли сделан snapshot?)
       ansible.builtin.assert:
         that: expand_root_confirm | string | lower in ['yes', 'true', '1']
@@ -337,4 +343,4 @@
           swap перенесён в файл {{ swapfile_path }} ({{ swapfile_size_mb }} MiB)
           {{ _lsblk_after.stdout }}
           {{ _final.stdout }}
-          -- следующий шаг: ansible-playbook playbooks/53-teamcity-proget.yml --limit {{ inventory_hostname }} --ask-vault-pass
+          -- следующий шаг: ansible-playbook playbooks/50-teamcity-migrate.yml --limit {{ inventory_hostname }} --ask-vault-pass

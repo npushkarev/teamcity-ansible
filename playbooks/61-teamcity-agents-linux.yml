@@ -604,6 +604,22 @@
               ansible.builtin.set_fact:
                 agent_new_ready: "{{ 'REGISTERED' in (agent_repoint.stdout | default('')) }}"
 
+            # Имена — до выключения старого: авторизация не должна зависеть от disable-old.
+            - name: "4R-2. Имена старого и нового агента"
+              ansible.builtin.raw: |
+                sed -n 's/^[[:space:]]*name[[:space:]]*[=:][[:space:]]*//p' {{ (old_dir ~ '/conf/buildAgent.properties') | quote }} 2>/dev/null | tail -n 1
+                echo '|'
+                sed -n 's/^[[:space:]]*name[[:space:]]*[=:][[:space:]]*//p' {{ new_dir }}/conf/buildAgent.properties 2>/dev/null | tail -n 1
+              register: agent_names_early
+              changed_when: false
+              when: agent_new_ready | bool
+
+            - name: "4R-2. Имена в факты"
+              ansible.builtin.set_fact:
+                agent_old_name: "{{ (agent_names_early.stdout.split('|')[0]) | trim }}"
+                agent_new_name: "{{ (agent_names_early.stdout.split('|')[1]) | trim }}"
+              when: agent_new_ready | bool
+
             # Старый агент 2018 (если переносили с --keep-old) — штатно, после сборки.
             - name: "4R-3. Выключить старого агента (teamcity-agent-linux-disable-old.sh)"
               ansible.builtin.raw: >-

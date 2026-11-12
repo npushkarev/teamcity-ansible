@@ -19,4 +19,5 @@ files/tls/*
 
 # Java для агентов и собранный дистрибутив агента — только локально.
 files/teamcity-agent/jdk/*
+!files/teamcity-agent/jdk/.gitkeep
 files/teamcity-agent/build/
