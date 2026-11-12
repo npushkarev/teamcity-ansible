@@ -33,7 +33,7 @@
   - пароль учётной записи службы старого Windows-агента, если она не LocalSystem (`teamcity_agent_service_password` у хоста).
 - [ ] **Образы в ProGet:** `library/teamcity-server` с тегом `2026.2-unlimited` и `library/postgres:16`. Если тег сервера другой — в `hosts.yml`: `teamcity_registry_server_image: proget.inc.elara.local/main/library/teamcity-server:<тег>`.
 - [ ] **Агенты в `inventory/hosts.yml`** — готовый список в `inventory/hosts.example.yml`: группы `teamcity_agents_linux` (19 машин, вместе с `ba-rosa-01` и `ba-deb-test`), `teamcity_agents_windows` (11, с настройками WinRM) и `pilot` (7 агентов, уже переведённых на тестовый `172.17.6.61`). Если у агента старый каталог не стандартный — у хоста `teamcity_agent_old_dir`; если старый Linux-агент работает от root — `teamcity_agent_user`.
-- [ ] **WinRM на Windows-агентах:** на Windows Server включён по умолчанию; на Windows 10/11 один раз в консоли `Enable-PSRemoting -Force`. Учётка Ansible — доменная, в локальных Administrators. Проверка: `ansible teamcity_agents_windows -m ansible.windows.win_ping --ask-vault-pass`.
+- [ ] **WinRM на Windows-агентах:** на Windows Server включён по умолчанию; на Windows 10/11 один раз в консоли `Enable-PSRemoting -Force`. Учётка Ansible — доменная, в локальных Administrators. Проверка: `ansible teamcity_agents_windows -m ansible.windows.win_ping -e @inventory/vault.yml --ask-vault-pass` (пароль WinRM — из `vault.yml`, поэтому `-e @inventory/vault.yml`).
 
 - [ ] **Сеть:** узнайте IP старого сервера (`nslookup teamcity.inc.elara.local`) и убедитесь, что на старой машине **нет других сервисов** (после отключения сети они станут недоступны).
 - [ ] **arping на новой ВМ** (нужен при смене IP): `ssh root@172.17.5.68 'apt-get install -y iputils-arping'`.
@@ -83,7 +83,7 @@
   ```
 
   (в `migration/` ещё лежит архив репетиции — так и нужно, в окне он заменится).
-- [ ] Windows: проверить WinRM на всех (`ansible teamcity_agents_windows -m ansible.windows.win_ping --ask-vault-pass`).
+- [ ] Windows: проверить WinRM на всех (`ansible teamcity_agents_windows -m ansible.windows.win_ping -e @inventory/vault.yml --ask-vault-pass`).
 - [ ] Открыть доступ в vSphere к обеим ВМ (сетевой адаптер и консоль).
 
 ## 4. День переезда (окно простоя)
